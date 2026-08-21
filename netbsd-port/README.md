@@ -1,0 +1,161 @@
+# Basilisk II on NetBSD/mac68k
+
+Running Basilisk II on a Macintosh Centris 650 (68040/25MHz, 68MB RAM,
+512KB VRAM, DAFB video) under NetBSD 10.1 — a 68k Mac emulator on a 68k
+Mac. Downstream port work; the host OS patches live in a separate tree.
+
+## Why this is worth attempting at all
+
+Basilisk II can execute guest 68k code **on the host CPU**, with no
+interpreter and no JIT. `configure.ac` gates that on `CAN_NATIVE_M68K`,
+and the `case "$target_os"` switch sets it for exactly one Unix:
+
+    netbsd*)
+      CAN_NATIVE_M68K=yes
+
+The native backend (`src/native_cpu/`, `Unix/asm_support.s`) is present.
+So applications inside the emulator run at the host's real speed and the
+display is the entire cost. Everything below follows from that.
+
+## The problem with the stock X11 path
+
+`video_x.cpp` is the only video backend in `Unix/`. Its windowed mode
+works in two steps per frame: `memcmp` the guest screen against a shadow
+copy to find what changed (`update_display_static`), then `XPutImage`
+the changed rectangle.
+
+Both steps were measured on the target with `fbbench` (in the host-OS
+tree), over a 640x480x8 frame:
+
+| operation | | |
+|---|---|---|
+| RAM compare | 7.21 MB/s | **40.6 ms/frame** |
+| RAM to RAM copy | 11.64 MB/s | 25.2 ms/frame |
+| RAM to VRAM (write) | 11.45 MB/s | 25.6 ms/frame |
+| VRAM to RAM (read) | 8.13 MB/s | 36.0 ms/frame |
+| VRAM clear (memset) | 21.41 MB/s | 13.7 ms/frame |
+
+The useful surprise: **the unaccelerated framebuffer is not the slow
+part.** A full-screen VRAM write costs 25.6 ms and a pure clear runs at
+21 MB/s, while comparing two buffers in ordinary RAM costs 40.6 ms — two
+thirds slower than writing to the "slow" uncached device memory.
+
+That scan runs *every frame even when nothing changes*, so the windowed
+path is capped near 24 fps doing nothing at all, and around 11 fps for
+full-screen updates (40.6 + 25.2 socket copy + 25.6 blit ≈ 91 ms).
+
+Why `memcmp` trails `memcpy` is **not explained**. NetBSD's m68k `memcmp`
+is not a byte loop (it converts to a longword count and uses `cmpml`),
+and neither it nor `memcpy` uses `movem`. Left open rather than guessed
+at a third time.
+
+## The approach: a wscons DGA backend
+
+`driver_fbdev` (a `driver_dga` subclass) already does the right thing on
+Linux — it `mmap`s the framebuffer device straight into `the_buffer`, the
+guest's screen. Zero copy: no shadow, no scan, no blit. All of the above
+costs vanish.
+
+That path uses **no Linux headers and no `FBIO*` ioctls**. It reads a
+text file of `name depth offset`, opens a device, and `mmap`s at that
+offset. So `driver_wscons` is a sibling class, not new architecture:
+
+- device `/dev/ttyE0` instead of `/dev/fb`
+- `WSDISPLAYIO_GET_FBINFO` instead of the `fbdevices` text file — the
+  kernel reports width, height, stride, depth and offset directly, so the
+  hand-maintained table disappears entirely
+- `WSDISPLAYIO_SMODE` → `MODE_DUMBFB` before the mmap, `MODE_EMUL` after
+  (no Linux equivalent, must be added)
+- palette through `WSDISPLAYIO_PUTCMAP`
+- `suspend`/`resume` become real rather than stubs: they are the
+  `SMODE` transitions, which the host's console driver already hooks
+
+`driver_fbdev` is ~150 lines. This should be comparable.
+
+VOSF (`--enable-vosf`, dirty pages via `mprotect` + `SIGSEGV`) becomes
+irrelevant if this works: VOSF exists to make the *scan* cheap, and this
+removes the scan, the shadow and the blit together.
+
+## Verified on hardware
+
+**Coexistence (the assumption everything rested on).** `driver_dga` keeps
+an X connection for input while bypassing it for drawing, so the X server
+and the emulator both hold the framebuffer mapped. Tested with
+`fbcoexist.c` against a live Xwscons:
+
+- `mmap` of `fboffset + fbsize` (311296 bytes) **succeeds** while X owns
+  the display — no `EBUSY`, no refusal
+- **no `SMODE` is needed** under X; the mapped mode is inherited, which
+  is how `driver_fbdev` behaves
+- the X server **survives** a second process writing into its framebuffer
+- drawing lands where expected and is visible
+- geometry reports stride 640, fboffset 4096 — so the host's panning
+  console driver does park its scanout when X enters mapped mode
+
+Consequence for the design: under X the constructor need not issue
+`SMODE` at all. It is still needed for a standalone (no X) run.
+
+**The CLUT is contested, and this is the real open question.** The probe
+wrote pixel values `0xff` and `0x80` expecting grey and white; they came
+out blue and dark, because at depth 8 those values are *indices into
+whatever palette is loaded* and X had allocated its own when it started.
+Writing pixels into a framebuffer is therefore only half the job — the
+guest's colours mean nothing until its palette is in the hardware CLUT,
+and while X is running X owns that CLUT.
+
+Upstream anticipates this: `video_x.cpp` keeps `static Colormap cmap[2]`
+with the comment that DGA needs two of them, and `driver_base` declares
+`update_palette()` as the hook. So the mechanism exists; what is not yet
+established is how it behaves on this port, where `WSDISPLAYIO_PUTCMAP`
+reaches the hardware through genfb's colormap callback and the host's
+console driver has its own opinions about the palette (it installs an
+r3g3b2 ramp at attach). Expect the emulator taking the CLUT to recolour
+the X session behind it, and vice versa.
+
+This is a fullscreen-DGA design, so the emulator owning the palette
+whenever it has focus is defensible — but it needs testing, not assuming.
+
+## Build notes
+
+**SDL is not required, but it is the default** — and `configure.ac` lies
+about that. The help text reads `[default=no]` while the default action
+sets `yes`:
+
+    AC_ARG_ENABLE(sdl-video, [ ... [default=no]], [WANT_SDL_VIDEO=$enableval], [WANT_SDL_VIDEO=yes])
+
+And `WANT_SDL_VIDEO=yes` sets `WANT_XF86_DGA=no`, `WANT_XF86_VIDMODE=no`
+and `WANT_FBDEV_DGA=no` — silently disabling every direct-framebuffer
+path. So the build must pass:
+
+    ./configure --disable-sdl-video --disable-sdl-audio
+
+which leaves `WANT_SDL=no` (no SDL dependency at all) and keeps the DGA
+paths available.
+
+**Audio.** With SDL audio off, the `netbsd*` case sets only
+`CAN_NATIVE_M68K` and `ETHERSRC`, never `AUDIOSRC`, so it falls through to
+`audio_dummy.cpp` — a silent emulator. `audio_oss_esd.cpp` exists and the
+target has working OSS emulation (`libossaudio`, `/dev/dsp` → `sound0`),
+so this is likely a one-line addition to that case. Unverified.
+
+**Cross-compilation.** Built in a Debian container against an m68k sysroot
+and toolchain. `configure`'s run-time probes cannot execute when cross
+compiling, so the cache needs seeding with answers established separately
+on the target — `sigsegv_recovery` in particular, if VOSF is ever wanted.
+
+**XF86 DGA is not an option here.** It needs the server to implement the
+XFree86-DGA extension, which kdrive/tinyx does not. `ENABLE_FBDEV_DGA`
+needs no X extension, only the device — which is why it is the viable one.
+
+## Guest configuration
+
+Run the guest at **640x480x8** to match the host exactly. Any depth or
+size mismatch forces per-pixel conversion; matched, it is a straight
+mapping. Every cost here is linear in pixels, so a smaller guest screen
+is a proportional saving if one is ever needed.
+
+## Files
+
+- `fbcoexist.c` — the coexistence probe described above. Deliberately
+  never restores `MODE_EMUL`: handing the console back while X is drawing
+  is what corrupts the display.

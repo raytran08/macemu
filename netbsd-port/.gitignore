@@ -1,0 +1,3 @@
+# cross-built m68k probe binaries; rebuild with the toolchain in the
+# nbwork docker volume, they are not portable and not worth carrying
+fbcoexist
