@@ -172,6 +172,46 @@ on the target — `sigsegv_recovery` in particular, if VOSF is ever wanted.
 XFree86-DGA extension, which kdrive/tinyx does not. `ENABLE_FBDEV_DGA`
 needs no X extension, only the device — which is why it is the viable one.
 
+## Build status
+
+`driver_wscons` is written and `configure` selects it. The build gets
+through the whole emulator -- CPU, video, audio, ethernet, SCSI, the lot --
+and stops in one place:
+
+    SDL support ............................ : none
+    XFree86 DGA support .................... : no
+    fbdev DGA support ...................... : no
+    wscons DGA support ..................... : yes
+    Enable video on SEGV signals ........... : no
+    Running m68k code natively ............. : yes
+
+**Blocker: `CrossPlatform/sigsegv.cpp` has no working NetBSD/m68k case.**
+
+It has one, but it was written when `struct sigcontext` was public API.
+On NetBSD 10 that struct is guarded:
+
+    /usr/include/m68k/signal.h:
+    #if defined(_LIBC) || defined(_KERNEL)
+    struct sigcontext {
+
+so an ordinary program cannot see it, and the block fails on an incomplete
+type, on `scp->sc_ap`, and on a `code` argument that no longer exists.
+
+Setting `BII_CROSS_HAVE_SIGCONTEXT_SUBTERFUGE=no` does not help: with no
+mechanism selected, neither `SIGSEGV_FAULT_HANDLER_ARGLIST` family gets
+defined and the file fails earlier still. sigsegv.cpp is compiled
+unconditionally and insists on one or the other, even with VOSF off.
+
+The fix is to port that block to the modern interface — a `siginfo_t` +
+`ucontext_t` handler in the extended-signals family rather than the
+legacy sigcontext one. NetBSD/m68k has what is needed:
+`m68k/mcontext.h` defines `__gregs` with `_REG_PC` (16) and `_REG_A7`
+(15), and the i386, x86_64 and powerpc NetBSD cases in the same file
+already show the shape (`((ucontext_t *)scp)->uc_mcontext.__gregs`).
+
+Note this is needed *despite* VOSF being disabled, so it is not optional
+work that could be skipped by giving up on dirty-page tracking.
+
 ## Guest configuration
 
 Run the guest at **640x480x8** to match the host exactly. Any depth or

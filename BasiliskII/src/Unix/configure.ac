@@ -28,6 +28,7 @@ dnl Video options.
 AC_ARG_ENABLE(xf86-dga,      [  --enable-xf86-dga       use the XFree86 DGA extension [default=yes]], [WANT_XF86_DGA=$enableval], [WANT_XF86_DGA=yes])
 AC_ARG_ENABLE(xf86-vidmode,  [  --enable-xf86-vidmode   use the XFree86 VidMode extension [default=yes]], [WANT_XF86_VIDMODE=$enableval], [WANT_XF86_VIDMODE=yes])
 AC_ARG_ENABLE(fbdev-dga,     [  --enable-fbdev-dga      use direct frame buffer access via /dev/fb [default=yes]], [WANT_FBDEV_DGA=$enableval], [WANT_FBDEV_DGA=yes])
+AC_ARG_ENABLE(wscons-dga,    [  --enable-wscons-dga     use direct frame buffer access via wsdisplay(4) (NetBSD) [default=no]], [WANT_WSCONS_DGA=$enableval], [WANT_WSCONS_DGA=no])
 AC_ARG_ENABLE(vosf,          [  --enable-vosf           enable video on SEGV signals [default=no]], [WANT_VOSF=$enableval], [WANT_VOSF=no])
 
 dnl SDL options.
@@ -433,6 +434,33 @@ AC_CHECK_FUNCS(sem_init, , [
     SEMSRC=posix_sem.cpp
   fi
 ])
+
+dnl wscons DGA (NetBSD): mmap wsdisplay(4) and let MacOS draw into it.
+dnl
+dnl Off by default, and mutually exclusive with the other two because all
+dnl three define the same DISPLAY_DGA case in video_x.cpp.  It has to be
+dnl settled BEFORE either of them: the XF86 branch below runs AC_DEFINE
+dnl and appends -lXxf86dga as soon as it finds the library, so standing
+dnl it down afterwards would be too late.
+dnl
+dnl Standing fbdev down matters more than it looks.  It is enabled for
+dnl EVERY platform, with no test for Linux and none for /dev/fb existing,
+dnl so it never declines on its own.
+if [[ "x$WANT_WSCONS_DGA" = "xyes" ]]; then
+  AC_CHECK_HEADER(dev/wscons/wsconsio.h, [
+    AC_DEFINE(ENABLE_WSCONS_DGA, 1, [Define if using DGA with wsdisplay(4).])
+    if [[ "x$WANT_FBDEV_DGA" = "xyes" ]]; then
+      WANT_FBDEV_DGA=no
+    fi
+    if [[ "x$WANT_XF86_DGA" = "xyes" ]]; then
+      AC_MSG_WARN([Cannot have both --enable-xf86-dga and --enable-wscons-dga, ignoring --enable-xf86-dga.])
+      WANT_XF86_DGA=no
+    fi
+  ], [
+    AC_MSG_WARN([Cannot find dev/wscons/wsconsio.h, ignoring --enable-wscons-dga.])
+    WANT_WSCONS_DGA=no
+  ])
+fi
 
 dnl We use DGA (XFree86 or fbdev) if possible.
 if [[ "x$WANT_XF86_DGA" = "xyes" ]]; then
@@ -1974,6 +2002,7 @@ echo VDE support ............................ : $have_vdeplug
 echo XFree86 DGA support .................... : $WANT_XF86_DGA
 echo XFree86 VidMode support ................ : $WANT_XF86_VIDMODE
 echo fbdev DGA support ...................... : $WANT_FBDEV_DGA
+echo wscons DGA support ..................... : $WANT_WSCONS_DGA
 echo Enable video on SEGV signals ........... : $WANT_VOSF
 echo ESD sound support ...................... : $WANT_ESD
 echo GTK user interface ..................... : $WANT_GTK

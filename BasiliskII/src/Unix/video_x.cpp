@@ -57,6 +57,12 @@
 # include <sys/mman.h>
 #endif
 
+#ifdef ENABLE_WSCONS_DGA
+# include <sys/mman.h>
+# include <sys/ioctl.h>
+# include <dev/wscons/wsconsio.h>
+#endif
+
 #include "cpu_emulation.h"
 #include "main.h"
 #include "adb.h"
@@ -1292,6 +1298,259 @@ driver_fbdev::~driver_fbdev()
 #endif
 
 
+#ifdef ENABLE_WSCONS_DGA
+/*
+ *  wscons DGA display driver (NetBSD)
+ *
+ *  The same idea as driver_fbdev -- map the display device and let MacOS
+ *  draw straight into it -- against NetBSD's wsdisplay(4) rather than
+ *  Linux fbdev.  On a 68k host running m68k code natively the display is
+ *  the entire cost of emulation, and the windowed path pays for it twice:
+ *  a memcmp of the whole screen every frame to find what changed, then an
+ *  XPutImage of the result.  Measured on a Centris 650 at 640x480x8 that
+ *  is 40.6 ms and 25.6 ms respectively, so the windowed server cannot
+ *  reach 25 fps even with nothing moving.  Mapping the framebuffer costs
+ *  neither.
+ *
+ *  Two things differ from the fbdev driver beyond the device name.
+ *
+ *  Geometry is asked for rather than configured.  WSDISPLAYIO_GET_FBINFO
+ *  reports width, height, stride, depth and the offset of the visible
+ *  framebuffer, so there is no equivalent of the fbdevices table to keep
+ *  in step with the hardware.  The offset matters: on mac68k it is 4096
+ *  and the mapping has to cover it as well as the framebuffer, or the
+ *  last page falls off the end.
+ *
+ *  The palette is borrowed, not owned.  At depth 8 a pixel is an index,
+ *  and the X server has allocated the map those indices land in, so the
+ *  guest's colours mean nothing until its own map is in the CLUT.  There
+ *  is one hardware colormap serving both, so this saves what it finds on
+ *  the way in and puts it back on the way out.  GETCMAP is used rather
+ *  than reading the RAMDAC: on this hardware a direct readback of the DAC
+ *  data register walks its R/G/B phase and turns the display red.
+ *
+ *  Verified before this was written (see netbsd-port/README.md): the mmap
+ *  succeeds while X holds the display, no SMODE is needed under X because
+ *  the mapped mode is inherited, the server survives a second process
+ *  writing its framebuffer, and PUTCMAP is accepted and restores exactly.
+ */
+
+const char WSCONS_DEVICE_FILE_NAME[] = "/dev/ttyE0";
+
+class driver_wscons : public driver_dga {
+public:
+	driver_wscons(X11_monitor_desc &monitor);
+	~driver_wscons();
+
+	void update_palette(void);
+
+private:
+	bool set_cmap(uint8 *r, uint8 *g, uint8 *b);
+
+	int ws_fd;			// wsdisplay device
+	bool ws_mode_set;		// we changed the mode and must undo it
+	bool ws_cmap_saved;		// ws_saved_* are valid
+	size_t ws_maplen;		// length passed to mmap()
+	uint8 *ws_map;			// mmap base, BEFORE fbi_fboffset
+	uint8 ws_saved_r[256], ws_saved_g[256], ws_saved_b[256];
+};
+
+bool driver_wscons::set_cmap(uint8 *r, uint8 *g, uint8 *b)
+{
+	struct wsdisplay_cmap cm;
+
+	memset(&cm, 0, sizeof(cm));
+	cm.index = 0;
+	cm.count = 256;
+	cm.red = (u_char *)r;
+	cm.green = (u_char *)g;
+	cm.blue = (u_char *)b;
+	return ioctl(ws_fd, WSDISPLAYIO_PUTCMAP, &cm) == 0;
+}
+
+// Open display
+driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
+	ws_fd(-1), ws_mode_set(false), ws_cmap_saved(false),
+	ws_maplen(0), ws_map(NULL)
+{
+	int width = mode.x, height = mode.y;
+	struct wsdisplayio_fbinfo fbi;
+	int wsmode;
+
+	// Set absolute mouse mode
+	ADBSetRelMouseMode(false);
+
+	const char *ws_path = PrefsFindString("wsconsdevice");
+	if (ws_path == NULL)
+		ws_path = WSCONS_DEVICE_FILE_NAME;
+
+	if ((ws_fd = open(ws_path, O_RDWR)) < 0) {
+		char str[256];
+		sprintf(str, "Cannot open %s: %s\n", ws_path, strerror(errno));
+		ErrorAlert(str);
+		return;
+	}
+
+	if (ioctl(ws_fd, WSDISPLAYIO_GET_FBINFO, &fbi) < 0) {
+		char str[256];
+		sprintf(str, "WSDISPLAYIO_GET_FBINFO on %s: %s\n", ws_path,
+			strerror(errno));
+		ErrorAlert(str);
+		return;
+	}
+
+	D(bug("wscons: %ux%u depth %u stride %u fboffset %lu fbsize %lu\n",
+		fbi.fbi_width, fbi.fbi_height, fbi.fbi_bitsperpixel,
+		fbi.fbi_stride, (unsigned long)fbi.fbi_fboffset,
+		(unsigned long)fbi.fbi_fbsize));
+
+	// The guest screen must match the hardware exactly: anything else
+	// would need per-pixel conversion, which is the cost this driver
+	// exists to avoid.
+	if ((int)fbi.fbi_width != width || (int)fbi.fbi_height != height) {
+		char str[256];
+		sprintf(str, "wscons is %ux%u but the guest wants %dx%d; they "
+			"must match\n", fbi.fbi_width, fbi.fbi_height,
+			width, height);
+		ErrorAlert(str);
+		return;
+	}
+
+	// Ask for mapped mode.  Under X this is already set and the request
+	// is redundant -- the mapping is inherited -- so a failure here is
+	// not fatal; it is only needed when running without a server.
+	wsmode = WSDISPLAYIO_MODE_DUMBFB;
+	if (ioctl(ws_fd, WSDISPLAYIO_SMODE, &wsmode) == 0)
+		ws_mode_set = true;
+	else
+		D(bug("wscons: SMODE DUMBFB refused (%s); assuming X has "
+			"already set it\n", strerror(errno)));
+
+	// Save the palette we are about to displace.
+	{
+		struct wsdisplay_cmap cm;
+
+		memset(&cm, 0, sizeof(cm));
+		cm.index = 0;
+		cm.count = 256;
+		cm.red = (u_char *)ws_saved_r;
+		cm.green = (u_char *)ws_saved_g;
+		cm.blue = (u_char *)ws_saved_b;
+		ws_cmap_saved = ioctl(ws_fd, WSDISPLAYIO_GETCMAP, &cm) == 0;
+		if (!ws_cmap_saved)
+			D(bug("wscons: GETCMAP failed (%s); the X palette "
+				"cannot be restored on exit\n",
+				strerror(errno)));
+	}
+
+	// Create window
+	XSetWindowAttributes wattr;
+	wattr.event_mask = eventmask = dga_eventmask;
+	wattr.background_pixel = white_pixel;
+	wattr.override_redirect = True;
+	wattr.colormap = cmap[0];
+
+	w = XCreateWindow(x_display, rootwin,
+		0, 0, width, height,
+		0, xdepth, InputOutput, vis,
+		CWEventMask | CWBackPixel | CWOverrideRedirect |
+		(fbi.fbi_bitsperpixel <= 8 ? CWColormap : 0),
+		&wattr);
+
+	set_window_name(w, false);
+	set_window_focus(w);
+	XMapRaised(x_display, w);
+	wait_mapped(w);
+
+	XGrabKeyboard(x_display, w, True,
+		GrabModeAsync, GrabModeAsync, CurrentTime);
+	XGrabPointer(x_display, w, True,
+		PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
+		GrabModeAsync, GrabModeAsync, w, None, CurrentTime);
+	disable_mouse_accel();
+
+	// Map the framebuffer.  fbi_fboffset must be inside the mapping, not
+	// merely added afterwards, or the final page is past its end.
+	ws_maplen = (size_t)fbi.fbi_fboffset + (size_t)fbi.fbi_fbsize;
+	ws_map = (uint8 *)mmap(NULL, ws_maplen, PROT_READ | PROT_WRITE,
+		MAP_SHARED, ws_fd, 0);
+	if (ws_map == MAP_FAILED) {
+		char str[256];
+		sprintf(str, "Cannot mmap %lu bytes of %s: %s\n",
+			(unsigned long)ws_maplen, ws_path, strerror(errno));
+		ErrorAlert(str);
+		ws_map = NULL;
+		return;
+	}
+
+	the_buffer = ws_map + fbi.fbi_fboffset;
+	the_buffer_size = (uint32)fbi.fbi_fbsize;
+
+	// Tell the rest of the server what the hardware actually gives us,
+	// rather than assuming the trivial value: wscons reports its own
+	// stride and it need not equal width * bytes-per-pixel.
+	mode.bytes_per_row = fbi.fbi_stride;
+
+	init_ok = true;
+}
+
+driver_wscons::~driver_wscons()
+{
+	if (ws_map != NULL) {
+		munmap(ws_map, ws_maplen);
+		ws_map = NULL;
+		// driver_base's destructor must not free() this
+		the_buffer = NULL;
+	}
+
+	if (ws_fd >= 0) {
+		// Give the palette back before the mode: while an X server is
+		// running it owns these colours, and leaving ours behind
+		// recolours its whole session.
+		if (ws_cmap_saved)
+			set_cmap(ws_saved_r, ws_saved_g, ws_saved_b);
+
+		// Only undo the mode if we set it.  Handing the console back
+		// underneath a still-running X server is what corrupts the
+		// display, so when SMODE was already X's doing, leave it be.
+		if (ws_mode_set) {
+			int wsmode = WSDISPLAYIO_MODE_EMUL;
+			ioctl(ws_fd, WSDISPLAYIO_SMODE, &wsmode);
+		}
+
+		close(ws_fd);
+		ws_fd = -1;
+	}
+}
+
+// MacOS has changed its colours: push them to the hardware CLUT.
+void driver_wscons::update_palette(void)
+{
+	driver_dga::update_palette();
+
+	if (ws_fd < 0)
+		return;
+
+	// Nothing to install in a direct-colour mode: the pixel carries its
+	// own colour and the CLUT is not consulted.
+	if (IsDirectMode(monitor.get_current_mode()))
+		return;
+
+	// x_palette is what the rest of this file maintains for the Mac's
+	// colours, in X's 16 bits per component; wscons wants 8.
+	uint8 r[256], g[256], b[256];
+
+	for (int i = 0; i < 256; i++) {
+		r[i] = (uint8)(x_palette[i].red >> 8);
+		g[i] = (uint8)(x_palette[i].green >> 8);
+		b[i] = (uint8)(x_palette[i].blue >> 8);
+	}
+	if (!set_cmap(r, g, b))
+		D(bug("wscons: PUTCMAP failed: %s\n", strerror(errno)));
+}
+#endif
+
+
 #ifdef ENABLE_XF86_DGA
 /*
  *  XFree86 DGA display driver
@@ -1611,6 +1870,11 @@ bool X11_monitor_desc::video_open(void)
 		case DISPLAY_WINDOW:
 			drv = new driver_window(*this);
 			break;
+#ifdef ENABLE_WSCONS_DGA
+		case DISPLAY_DGA:
+			drv = new driver_wscons(*this);
+			break;
+#endif
 #ifdef ENABLE_FBDEV_DGA
 		case DISPLAY_DGA:
 			drv = new driver_fbdev(*this);
