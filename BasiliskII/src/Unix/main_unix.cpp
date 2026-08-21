@@ -305,10 +305,6 @@ static void sigsegv_dump_state(sigsegv_info_t *sip)
 {
 	const sigsegv_address_t fault_address = sigsegv_get_fault_address(sip);
 	const sigsegv_address_t fault_instruction = sigsegv_get_fault_instruction_address(sip);
-	/* TEMPORARY: where does the guest think the ROM is? */
-	fprintf(stderr, "lowmem: ROMBase[0x2ae]=%08x  ROMBaseMac=%08x  "
-	    "RAMBaseMac=%08x\n", (unsigned)ReadMacInt32(0x2ae),
-	    (unsigned)ROMBaseMac, (unsigned)RAMBaseMac);
 	fprintf(stderr, "Caught SIGSEGV at address %p", fault_address);
 	if (fault_instruction != SIGSEGV_INVALID_ADDRESS)
 		fprintf(stderr, " [IP=%p]", fault_instruction);
@@ -459,72 +455,6 @@ static void gui_activate (GtkApplication *app)
 #endif
 
 
-/*
- * TEMPORARY -- test of the null-pointer hypothesis.
- *
- * With RAM mapped from zero, address 0 is valid, mapped and full of
- * zeros, so a call through a null or uninitialised function pointer no
- * longer dies with a clean SIGSEGV: it jumps into guest RAM and executes
- * zeros until it meets something illegal.  That would produce exactly the
- * early, unexplained SIGILL seen here.
- *
- * The PC settles it.  Executing guest memory means a low PC (RAM is
- * 0x0 to 0x800000, ROM above that).  A genuine bad instruction in our own
- * code means a PC up at 0x10000000, where the image is now linked.
- */
-static void early_sigill(int sig, siginfo_t *sip, void *uap)
-{
-	ucontext_t *ucp = (ucontext_t *)uap;
-	__greg_t *gr = ucp->uc_mcontext.__gregs;
-
-	fprintf(stderr, "EARLY FAULT sig=%d: pc=%08x sr=%04x fault=%p\n", sig,
-	    (unsigned)gr[_REG_PC], (unsigned)gr[_REG_PS],
-	    sip ? sip->si_addr : NULL);
-	fprintf(stderr, "  a7=%08x a6=%08x d0=%08x\n",
-	    (unsigned)gr[_REG_A7], (unsigned)gr[_REG_A6],
-	    (unsigned)gr[_REG_D0]);
-	fprintf(stderr, "  %s\n", (unsigned)gr[_REG_PC] < 0x01000000u ?
-	    "PC IS LOW -> executing guest memory (null-pointer jump)" :
-	    "PC is in our own text -> a real illegal instruction");
-	_exit(9);
-}
-
-static void install_early_sigill(void)
-{
-	struct sigaction sa;
-
-	static char altstack[SIGSTKSZ * 4];
-	stack_t ss;
-
-	/*
-	 * On its own stack, and that matters here.  The first attempt at
-	 * this handler never ran: the process died with the default action
-	 * even though the handler was installed.  Signal delivery has to
-	 * push a frame onto the user stack, so a wild stack pointer means
-	 * the kernel cannot deliver and kills the process instead -- and a
-	 * wild a7 is exactly what jumping into garbage produces.  An
-	 * alternate stack sidesteps that.
-	 */
-	memset(&ss, 0, sizeof(ss));
-	ss.ss_sp = altstack;
-	ss.ss_size = sizeof(altstack);
-	ss.ss_flags = 0;
-	if (sigaltstack(&ss, NULL) < 0)
-		fprintf(stderr, "mtrace: sigaltstack failed: %s\n",
-		    strerror(errno));
-
-	memset(&sa, 0, sizeof(sa));
-	sigemptyset(&sa.sa_mask);
-	sa.sa_sigaction = early_sigill;
-	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-	if (sigaction(SIGILL, &sa, NULL) < 0)
-		fprintf(stderr, "mtrace: sigaction(SIGILL) failed: %s\n",
-		    strerror(errno));
-	/* SIGBUS and SIGSEGV too: a wild jump may trip either first */
-	sigaction(SIGBUS, &sa, NULL);
-	sigaction(SIGSEGV, &sa, NULL);
-	fprintf(stderr, "mtrace: early fault handlers installed (altstack)\n");
-}
 
 int main(int argc, char **argv)
 {
@@ -676,13 +606,10 @@ int main(int argc, char **argv)
 	 * of one stops answering every client -- which is the failure seen
 	 * on this port.
 	 */
-	install_early_sigill();
-	fprintf(stderr, "mtrace: about to XInitThreads/XOpenDisplay\n");
 	if (!XInitThreads())
 		fprintf(stderr, "warning: XInitThreads() failed\n");
 
 	x_display = XOpenDisplay(x_display_name);
-	fprintf(stderr, "mtrace: XOpenDisplay returned %p\n", (void *)x_display);
 	if (x_display == NULL) {
 		char str[256];
 		sprintf(str, GetString(STR_NO_XSERVER_ERR), XDisplayName(x_display_name));
@@ -791,10 +718,8 @@ int main(int argc, char **argv)
 	const bool can_map_all_memory = false;
 #endif
 
-	fprintf(stderr, "mtrace: RAMSize=%u can_map_all_memory=%d\n", (unsigned)RAMSize, (int)can_map_all_memory);
 	// Try to allocate all memory from 0x0000, if it is not known to crash
 	if (can_map_all_memory && (vm_acquire_mac_fixed(0, RAMSize + ROM_MAX_SIZE) == 0)) {
-		fprintf(stderr, "mtrace: mapped RAM+ROM from 0x0000\n");
 		D(bug("Could allocate RAM and ROM from 0x0000\n"));
 		memory_mapped_from_zero = true;
 	}
@@ -815,13 +740,11 @@ int main(int argc, char **argv)
 #endif
 #endif /* REAL_ADDRESSING */
 
-	fprintf(stderr, "mtrace: memory areas decided\n");
 	// Create areas for Mac RAM and ROM
 #if REAL_ADDRESSING
 	if (memory_mapped_from_zero) {
 		RAMBaseHost = (uint8 *)0;
 		ROMBaseHost = RAMBaseHost + RAMSize;
-		fprintf(stderr, "mtrace: bases set RAM=%p ROM=%p\n", (void*)RAMBaseHost, (void*)ROMBaseHost);
 	}
 	else
 #endif
@@ -843,8 +766,7 @@ int main(int argc, char **argv)
 		ErrorAlert(STR_NO_MEM_ERR);
 		QuitEmulator();
 	}
-	ScratchMem += SCRATCH_MEM_SIZE/2;
-	fprintf(stderr, "mtrace: ScratchMem=%p\n", (void*)ScratchMem);	// ScratchMem points to middle of block
+	ScratchMem += SCRATCH_MEM_SIZE/2;	// ScratchMem points to middle of block
 #endif
 
 #if DIRECT_ADDRESSING
@@ -860,9 +782,7 @@ int main(int argc, char **argv)
 
 #if SDL_PLATFORM_MACOS
 	extern void set_current_directory();
-	fprintf(stderr, "mtrace: about to set_current_directory\n");
 	set_current_directory();
-	fprintf(stderr, "mtrace: set_current_directory done\n");
 #endif
 
 	// Get rom file path from preferences
@@ -882,7 +802,6 @@ int main(int argc, char **argv)
 		QuitEmulator();
 	}
 	lseek(rom_fd, 0, SEEK_SET);
-	fprintf(stderr, "mtrace: reading ROM to %p size %u\n", (void *)ROMBaseHost, (unsigned)ROMSize);
 	if (read(rom_fd, ROMBaseHost, ROMSize) != (ssize_t)ROMSize) {
 		ErrorAlert(STR_ROM_FILE_READ_ERR);
 		close(rom_fd);
@@ -939,19 +858,15 @@ int main(int argc, char **argv)
 		    MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
 
 		if (hw == MAP_FAILED)
-			fprintf(stderr, "mtrace: could not map ROM at "
-			    "0x40800000: %s\n", strerror(errno));
-		else {
+			fprintf(stderr, "warning: could not map ROM at its "
+			    "hardware address 0x40800000: %s\n",
+			    strerror(errno));
+		else
 			memcpy(hw, ROMBaseHost, ROMSize);
-			fprintf(stderr, "mtrace: ROM also mapped at "
-			    "0x40800000 (%u bytes)\n", (unsigned)ROMSize);
-		}
 	}
 
-	fprintf(stderr, "mtrace: ROM read ok; entering InitAll\n");
 	if (!InitAll(vmdir))
 		QuitEmulator();
-	fprintf(stderr, "mtrace: InitAll returned\n");
 	D(bug("Initialization complete\n"));
 
 	D(bug("Mac RAM starts at %p (%08x)\n", RAMBaseHost, RAMBaseMac));
@@ -985,7 +900,6 @@ int main(int argc, char **argv)
 
 	// Install SIGILL handler for emulating privileged instructions and
 	// executing A-Trap and EMUL_OP opcodes
-	fprintf(stderr, "mtrace: installing signal handlers\n");
 	sigemptyset(&sigill_sa.sa_mask);	// Block virtual 68k interrupts during SIGILL handling
 	sigaddset(&sigill_sa.sa_mask, SIG_IRQ);
 	sigaddset(&sigill_sa.sa_mask, SIGALRM);
@@ -1092,7 +1006,6 @@ int main(int argc, char **argv)
 
 	// Start 68k and jump to ROM boot routine
 	D(bug("Starting emulation...\n"));
-	fprintf(stderr, "mtrace: about to Start680x0 (guest begins)\n");
 	Start680x0();
 
 	QuitEmulator();
@@ -1539,14 +1452,25 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	 * anything outside that is not ours to interrupt.  Dropping the tick
 	 * is harmless: another arrives in 1/60s.
 	 */
-	if ((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) {
-		static int dropped;
+	static unsigned long irq_deferred, irq_delivered;
 
-		if (dropped < 5)
-			fprintf(stderr, "sigirq: not in guest (pc=%08x), "
-			    "tick dropped\n", (unsigned)sc_pc), dropped++;
+	if ((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) {
+		/*
+		 * Not in guest code, so a frame built here would capture a
+		 * host pc.  Leave the interrupt PENDING rather than losing
+		 * it: InterruptFlags stays set and EmulOpTrampoline
+		 * re-triggers on the way back out of native code.
+		 */
+		irq_deferred++;
+		if ((irq_deferred % 200) == 1)
+			fprintf(stderr, "irq: deferred=%lu delivered=%lu\n",
+			    irq_deferred, irq_delivered);
 		return;
 	}
+	irq_delivered++;
+	if ((irq_delivered % 200) == 1)
+		fprintf(stderr, "irq: deferred=%lu delivered=%lu\n",
+		    irq_deferred, irq_delivered);
 
 
 	// Set up interrupt frame on stack
@@ -1595,43 +1519,7 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
 
-	/*
-	 * TEMPORARY.  Record where the video driver's entry points actually
-	 * are, in the SAME run as any fault, so the driver base is measured
-	 * rather than inferred by chaining two runs together.
-	 * 0x7118/19/1a are VIDEO_OPEN / VIDEO_CONTROL / VIDEO_STATUS, whose
-	 * declared offsets in the slot ROM are 0x32 / 0x3a / 0x46.
-	 */
-	if (opcode >= 0x7118 && opcode <= 0x711a) {
-		static int v;
 
-		if (v < 12) {
-			static const int off[3] = { 0x32, 0x3a, 0x46 };
-			fprintf(stderr, "video op %04x at pc=%08x -> driver "
-			    "base %08x\n", (unsigned)opcode, (unsigned)sc_pc,
-			    (unsigned)sc_pc - off[opcode - 0x7118]);
-			v++;
-		}
-	}
-
-	/*
-	 * TEMPORARY.  This handler is the whole of native 68k mode: every
-	 * privileged instruction and every A-trap the guest executes lands
-	 * here.  Its machine-context access was rewritten for ucontext, so
-	 * if the guest is going astray this is the first place to look --
-	 * and whether it is called at all is itself the answer.
-	 */
-	{
-		static int ill_count;
-
-		if (ill_count < 20000) {
-			fprintf(stderr, "sigill[%d]: pc=%08x op=%04x sr=%04x "
-			    "a7=%08x\n", ill_count, (unsigned)sc_pc,
-			    (unsigned)opcode, (unsigned)sc_ps,
-			    (unsigned)sc_sp);
-			ill_count++;
-		}
-	}
 
 #define INC_PC(n) sc_pc += (n)
 
@@ -1680,16 +1568,6 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 
 		// Jump to EmulOp trampoline code on return
 		sc_pc = (uint32)EmulOpTrampoline;
-		{	/* TEMPORARY */
-			static int t;
-			if (t < 0) {
-				fprintf(stderr, "  EMUL_OP branch: new a7=%08x "
-				    "trampoline=%08x saved_pc@66=%08x\n",
-				    (unsigned)a7, (unsigned)sc_pc,
-				    (unsigned)ReadMacInt32(a7 + 66));
-				t++;
-			}
-		}
 		
 	} else switch (opcode) {	// Emulate privileged instructions
 
@@ -1815,20 +1693,6 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 				0, 0, 4, 4, 8, 0, 0, 52, 50, 12, 24, 84, 16, 0, 0, 0
 			};
 			sc_sp = regs->a[7] = a7 + frame_adj[format];
-			/*
-			 * TEMPORARY.  The guest dies jumping to 0xff00ff00
-			 * right after an RTE, so report any exception return
-			 * to an address that cannot be code: guest RAM is
-			 * 0..RAMSize and ROM sits just above it.
-			 */
-			if ((uint32)sc_pc >= 0x00900000u)
-				fprintf(stderr, "  RTE to implausible pc=%08x "
-				    "(sr=%04x format=%x adj=%d oldA7=%08x "
-				    "newA7=%08x)\n", (unsigned)sc_pc,
-				    (unsigned)sr, (unsigned)format,
-				    frame_adj[format],
-				    (unsigned)regs->a[7] - frame_adj[format] - 8,
-				    (unsigned)sc_sp);
 			break;
 		}
 
@@ -1891,38 +1755,7 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 			break;
 
 		default:
-ill:		{	/* TEMPORARY: what does memory around PC actually hold? */
-			/*
-			 * Dump the whole driver as copied into RAM, from its
-			 * base, so it can be compared byte-for-byte with what
-			 * slot_rom.cpp emits.  Control's escape is at 0x3a and
-			 * we fault at 0x3c, so base = pc - 0x3c.
-			 */
-			uint16 *drv = (uint16 *)(((uint32)sc_pc & ~1) - 0x3c);
-			printf("driver as copied, base %08x, 0x72 bytes:\n",
-			    (unsigned)(uint32)drv);
-			for (int r = 0; r < 15; r++) {
-				printf("  +%02x:", r * 8);
-				for (int c = 0; c < 4; c++)
-					printf(" %04x", (unsigned)drv[r*4+c]);
-				printf("\n");
-			}
-			printf("source: +30 flags/offsets, +32 OPEN 4e75, "
-			    "+36 70ff 600e, +3a CTRL 0c68 0001 001a 6604 4e75, "
-			    "+46 STAT ...\n");
-			uint16 *w = (uint16 *)((uint32)sc_pc & ~1);
-			printf("memory around pc:\n");
-			for (int r = -4; r < 6; r++) {
-				printf("  %08x:", (unsigned)((uint32)w + r * 8));
-				for (int c = 0; c < 4; c++)
-					printf(" %04x",
-					    (unsigned)w[r * 4 + c]);
-				printf("\n");
-			}
-			printf("expected at Control(): 7119 0c68 0001 001a "
-			    "6604 4e75\n");
-		}
-		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
+ill:		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
 			printf(" context %p:\n", (void *)ucp);
 			printf("  uc_flags %08x\n", (unsigned)ucp->uc_flags);
 			printf("  sp %08x\n", sc_sp);

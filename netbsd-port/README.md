@@ -274,7 +274,36 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
-## Status: IT BOOTS
+## Status: reaches "Welcome to Macintosh", does not get past it
+
+Correction to an earlier claim here: this is NOT a completed boot.  Mac OS
+displays the welcome screen and then makes no further progress, and runs
+crash intermittently with
+
+    Caught SIGSEGV at address 0x9fc0000 [IP=0x9fc0000]
+
+IP equals the address, so the guest branches there -- the same signature
+that last time turned out to be memory corruption rather than a bad
+branch.
+
+**Interrupt starvation is ruled out.**  Counting delivery in
+`sigirq_handler` gives 601 ticks delivered against 287 deferred, so the
+guest gets roughly two thirds of its 60Hz interrupts.  That was the
+leading theory and it is wrong.
+
+**Leading suspect is the 0x40800000 ROM mapping**, added here.  The ROM
+now exists twice: at 0x800000 where Basilisk II places it, and at
+0x40800000 as a `MAP_ANON | MAP_PRIVATE` copy satisfying the ROM's
+baked-in absolute references.  Those are independent pages.  MacOS
+patches its ROM in place during startup, so a patch applied to one copy
+is invisible in the other -- and code executing from 0x40800000 would run
+unpatched.  A boot that reaches the welcome screen and then wanders off
+fits that exactly.
+
+If so, the fix is to make the second address share the *same* memory
+rather than duplicate it, so both views stay identical.
+
+## Earlier status: IT BOOTS (overstated -- see above)
 
 Mac OS starts on the Centris 650 and reaches "Welcome to Macintosh" --
 the ROM finds the disk, loads the System file and hands control to it.

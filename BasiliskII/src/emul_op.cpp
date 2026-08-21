@@ -119,17 +119,6 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 		}
 
 		case M68K_EMUL_OP_CLKNOMEM: {		// Clock/PRAM operations
-			{	/* TEMPORARY: what is the ROM asking of the clock? */
-				static int t;
-				if (t < 0) {
-					fprintf(stderr, "  CLKNOMEM d1=%08x "
-					    "(read=%d sel=%02x)\n",
-					    (unsigned)r->d[1],
-					    (int)((r->d[1] & 0x80) != 0),
-					    (unsigned)(r->d[1] & 0x78));
-					t++;
-				}
-			}
 			bool is_read = (r->d[1] & 0x80) != 0;
 			if ((r->d[1] & 0x78) == 0x38) {
 				// XPRAM

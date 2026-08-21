@@ -60,6 +60,7 @@
 #ifdef ENABLE_WSCONS_DGA
 # include <sys/mman.h>
 # include <sys/ioctl.h>
+# include <sys/sysctl.h>
 # include <dev/wscons/wsconsio.h>
 #endif
 
@@ -1347,17 +1348,6 @@ driver_fbdev::~driver_fbdev()
 
 const char WSCONS_DEVICE_FILE_NAME[] = "/dev/ttyE0";
 
-/*
- * TEMPORARY -- remove once the server wedge is found.
- *
- * stderr, not printf: stdout is block-buffered when redirected to a file,
- * so traces from earlier attempts died in the buffer when the process was
- * killed and every log came back empty.
- */
-#define WSTRACE(...) do { \
-	fprintf(stderr, "wstrace: " __VA_ARGS__); \
-	fputc('\n', stderr); \
-} while (0)
 
 class driver_wscons : public driver_dga {
 public:
@@ -1371,6 +1361,8 @@ private:
 
 	int ws_fd;			// wsdisplay device
 	bool ws_mode_set;		// we changed the mode and must undo it
+	bool ws_kcursor_saved;		// ws_kcursor_was is valid
+	int ws_kcursor_was;		// hw.dafbcons.cursor as we found it
 	bool ws_cmap_saved;		// ws_saved_* are valid
 	size_t ws_maplen;		// length passed to mmap()
 	uint8 *ws_map;			// mmap base, BEFORE fbi_fboffset
@@ -1392,15 +1384,14 @@ bool driver_wscons::set_cmap(uint8 *r, uint8 *g, uint8 *b)
 
 // Open display
 driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
-	ws_fd(-1), ws_mode_set(false), ws_cmap_saved(false),
-	ws_maplen(0), ws_map(NULL)
+	ws_fd(-1), ws_mode_set(false), ws_kcursor_saved(false),
+	ws_kcursor_was(0), ws_cmap_saved(false), ws_maplen(0), ws_map(NULL)
 {
 	int width = mode.x, height = mode.y;
 	struct wsdisplayio_fbinfo fbi;
 	int wsmode;
 
 	// Set absolute mouse mode
-	WSTRACE("constructor entered");
 	ADBSetRelMouseMode(false);
 
 	const char *ws_path = PrefsFindString("wsconsdevice");
@@ -1492,7 +1483,6 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 				strerror(errno)));
 	}
 
-	WSTRACE("fbinfo, mode and palette done; creating window");
 	// Create window
 	XSetWindowAttributes wattr;
 	wattr.event_mask = eventmask = dga_eventmask;
@@ -1507,24 +1497,17 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 		(fbi.fbi_bitsperpixel <= 8 ? CWColormap : 0),
 		&wattr);
 
-	WSTRACE("XCreateWindow returned");
 	set_window_name(w, false);
-	WSTRACE("set_window_name done");
 	set_window_focus(w);
-	WSTRACE("set_window_focus done");
 	XMapRaised(x_display, w);
-	WSTRACE("XMapRaised done; entering wait_mapped");
 	wait_mapped(w);
-	WSTRACE("wait_mapped returned");
 
 	XGrabKeyboard(x_display, w, True,
 		GrabModeAsync, GrabModeAsync, CurrentTime);
 	XGrabPointer(x_display, w, True,
 		PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
 		GrabModeAsync, GrabModeAsync, w, None, CurrentTime);
-	WSTRACE("grabs done");
 	disable_mouse_accel();
-	WSTRACE("disable_mouse_accel done");
 
 	// Map the framebuffer.  fbi_fboffset must be inside the mapping, not
 	// merely added afterwards, or the final page is past its end.
@@ -1581,7 +1564,6 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 		return;
 	}
 
-	WSTRACE("mmap ok");
 	the_buffer = ws_map + fbi.fbi_fboffset;
 	the_buffer_size = (uint32)fbi.fbi_fbsize;
 
@@ -1612,10 +1594,39 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 	 * a couple of instructions and then ran into the wreckage.  Every
 	 * other backend does this; driver_wscons did not.
 	 */
+	/*
+	 * Stand the console's kernel cursor down for as long as we hold the
+	 * display.
+	 *
+	 * dafbcons can draw the X pointer straight into the framebuffer from
+	 * the vertical blank interrupt, which is what stops it tearing under
+	 * ordinary X use.  But a DGA guest owns that framebuffer and draws
+	 * its own cursor there, so both end up painting the same pixels: the
+	 * Mac pointer appears and is then repainted over on the next mouse
+	 * movement.
+	 *
+	 * Save what we find and put it back in the destructor, exactly as
+	 * for the palette.  Absent dafbcons the sysctl simply is not there,
+	 * which is not an error.
+	 */
+	{
+		int off = 0, was = 0;
+		size_t len = sizeof(was);
+
+		if (sysctlbyname("hw.dafbcons.cursor", &was, &len,
+		    NULL, 0) == 0) {
+			ws_kcursor_was = was;
+			ws_kcursor_saved = true;
+			if (was)
+				sysctlbyname("hw.dafbcons.cursor", NULL, NULL,
+				    &off, sizeof(off));
+			D(bug("wscons: kernel cursor was %d, stood down\n",
+			    was));
+		}
+	}
+
 	set_mac_frame_buffer(monitor, mode.depth, true);
 
-	WSTRACE("CONSTRUCTOR COMPLETE (frame base %08x)",
-	    (unsigned)monitor.get_mac_frame_base());
 	init_ok = true;
 }
 
@@ -1629,6 +1640,11 @@ driver_wscons::~driver_wscons()
 	}
 
 	if (ws_fd >= 0) {
+		// Give the console its cursor back before anything else.
+		if (ws_kcursor_saved && ws_kcursor_was)
+			sysctlbyname("hw.dafbcons.cursor", NULL, NULL,
+			    &ws_kcursor_was, sizeof(ws_kcursor_was));
+
 		// Give the palette back before the mode: while an X server is
 		// running it owns these colours, and leaving ours behind
 		// recolours its whole session.
@@ -1912,7 +1928,6 @@ bool X11_monitor_desc::video_open(void)
 	const video_mode &mode = get_current_mode();
 
 	// Find best available X visual
-	fprintf(stderr, "vtrace: entering find_visual_for_depth\n");
 	if (!find_visual_for_depth(mode.depth)) {
 		ErrorAlert(STR_NO_XVISUAL_ERR);
 		return false;
@@ -1947,11 +1962,9 @@ bool X11_monitor_desc::video_open(void)
 		 * exist only to satisfy the window attributes; read-only ones
 		 * do that just as well.
 		 */
-		fprintf(stderr, "vtrace: creating AllocNone colormaps\n");
 		cmap[0] = XCreateColormap(x_display, rootwin, vis, AllocNone);
 		cmap[1] = XCreateColormap(x_display, rootwin, vis, AllocNone);
 		XSync(x_display, False);
-		fprintf(stderr, "vtrace: colormaps created\n");
 #else
 		cmap[0] = XCreateColormap(x_display, rootwin, vis, AllocAll);
 		cmap[1] = XCreateColormap(x_display, rootwin, vis, AllocAll);
@@ -2024,7 +2037,6 @@ bool X11_monitor_desc::video_open(void)
 #endif
 
 	// Create display driver object of requested type
-	fprintf(stderr, "vtrace: about to construct driver (type %d)\n", display_type);
 	switch (display_type) {
 		case DISPLAY_WINDOW:
 			drv = new driver_window(*this);
