@@ -274,6 +274,35 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
+## Status: driver_wscons proven; guest dies in a truncated driver copy
+
+**driver_wscons coexists with X correctly.**  Tested with the DGA path
+actually selected (the earlier wedge was the windowed driver, which we
+were unknowingly running): the emulator runs, and `xdpyinfo` answers
+throughout -- **X ALIVE**.  The backend maps the framebuffer, grabs
+input, drives the palette and does not disturb the server.
+
+The guest boots ROM code natively, opens the video driver and calls its
+Control routine successfully, then faults.
+
+**The fault is precisely located.**  The slot ROM declares the video
+driver with Open at 0x32, Prime 0x36, Control 0x3a, Status 0x46, Close
+0x6c.  The Control EMUL_OP executed at guest 0x5f8a, so the driver base
+in RAM is 0x5f8a - 0x3a = 0x5f50.  The fault is at 0x5fbc, which is
+0x5f50 + 0x6c -- exactly the **Close** entry point.  It contains 0xff00
+fill.
+
+The slot ROM itself is not at fault, twice over: it is placed correctly
+(size 1330 at Mac 0x008fface, carrying the "Basilisk" identifier), and
+the emitted driver is complete -- counting from Status at 0x46 the code
+runs to `Word(0x70e8)` at exactly 0x6c and ends at 0x70, inside the
+declared length 0x72.
+
+So the driver is **truncated when MacOS copies it out of the slot ROM
+into the system heap**: Control at 0x3a survives and runs, Close at 0x6c
+does not.  Establishing why that copy is short is the next task -- it is
+a bounded question with the source and destination both known.
+
 ## Status: boots deep, then executes unmapped-space fill
 
 Real fix landed: **the 60Hz interrupt was corrupting non-guest context.**
