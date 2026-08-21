@@ -121,6 +121,14 @@ export BII_CROSS_SOCKLEN_T=yes
 export BII_CROSS_MMAP_ANON=yes
 export BII_CROSS_MPROTECT_WORKS=yes
 
+# NOT set, and it would not help: despite its description, this feeds
+# PAGEZERO_HACK, which is the Mach-O __PAGEZERO trick and macOS-only.
+# The low memory globals on NetBSD are mapped by main_unix.cpp at run time
+# and that works -- but only with vm.user_va0_disable=0, since NetBSD
+# otherwise refuses to map page zero.  That sysctl is a RUNTIME
+# requirement and does not survive a reboot.
+#   export BII_CROSS_MAP_LOW_AREA=yes
+
 # --disable-sdl-video is NOT redundant: configure.ac's help text claims it
 # defaults to no while the code defaults it to yes, and enabling it turns
 # off every direct-framebuffer path including ours.

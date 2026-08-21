@@ -595,7 +595,21 @@ int main(int argc, char **argv)
 
 #ifndef USE_SDL_VIDEO
 	// Open display
+	/*
+	 * Must precede every other Xlib call.  Xlib keeps unprotected global
+	 * state, and this emulator is both multi-threaded (redraw and tick
+	 * threads) and, in the native 68k build, interrupted by SIGALRM and
+	 * SIG_IRQ continuously.  A request interrupted part-written leaves a
+	 * partial request on the socket, and a server waiting for the rest
+	 * of one stops answering every client -- which is the failure seen
+	 * on this port.
+	 */
+	fprintf(stderr, "mtrace: about to XInitThreads/XOpenDisplay\n");
+	if (!XInitThreads())
+		fprintf(stderr, "warning: XInitThreads() failed\n");
+
 	x_display = XOpenDisplay(x_display_name);
+	fprintf(stderr, "mtrace: XOpenDisplay returned %p\n", (void *)x_display);
 	if (x_display == NULL) {
 		char str[256];
 		sprintf(str, GetString(STR_NO_XSERVER_ERR), XDisplayName(x_display_name));
@@ -965,6 +979,7 @@ int main(int argc, char **argv)
 
 	// Start 68k and jump to ROM boot routine
 	D(bug("Starting emulation...\n"));
+	fprintf(stderr, "mtrace: about to Start680x0 (guest begins)\n");
 	Start680x0();
 
 	QuitEmulator();

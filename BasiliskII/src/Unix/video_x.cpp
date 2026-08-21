@@ -1857,6 +1857,7 @@ bool X11_monitor_desc::video_open(void)
 	const video_mode &mode = get_current_mode();
 
 	// Find best available X visual
+	fprintf(stderr, "vtrace: entering find_visual_for_depth\n");
 	if (!find_visual_for_depth(mode.depth)) {
 		ErrorAlert(STR_NO_XVISUAL_ERR);
 		return false;
@@ -1891,8 +1892,11 @@ bool X11_monitor_desc::video_open(void)
 		 * exist only to satisfy the window attributes; read-only ones
 		 * do that just as well.
 		 */
+		fprintf(stderr, "vtrace: creating AllocNone colormaps\n");
 		cmap[0] = XCreateColormap(x_display, rootwin, vis, AllocNone);
 		cmap[1] = XCreateColormap(x_display, rootwin, vis, AllocNone);
+		XSync(x_display, False);
+		fprintf(stderr, "vtrace: colormaps created\n");
 #else
 		cmap[0] = XCreateColormap(x_display, rootwin, vis, AllocAll);
 		cmap[1] = XCreateColormap(x_display, rootwin, vis, AllocAll);
@@ -1965,6 +1969,7 @@ bool X11_monitor_desc::video_open(void)
 #endif
 
 	// Create display driver object of requested type
+	fprintf(stderr, "vtrace: about to construct driver (type %d)\n", display_type);
 	switch (display_type) {
 		case DISPLAY_WINDOW:
 			drv = new driver_window(*this);
@@ -2072,6 +2077,22 @@ bool VideoInit(bool classic)
 		has_dga = false;
 #endif
 
+#ifdef ENABLE_WSCONS_DGA
+	/*
+	 * wscons DGA is available if the display device can be opened.
+	 * Unlike the XFree86 extension there is nothing to ask the server
+	 * about -- the framebuffer belongs to the kernel, not to X.
+	 */
+	{
+		const char *p = PrefsFindString("wsconsdevice");
+		int fd = open(p ? p : WSCONS_DEVICE_FILE_NAME, O_RDWR);
+
+		has_dga = (fd >= 0);
+		if (fd >= 0)
+			close(fd);
+	}
+#endif
+
 #ifdef ENABLE_XF86_DGA
 	// DGA available?
 	int dga_event_base, dga_error_base;
@@ -2120,6 +2141,20 @@ bool VideoInit(bool classic)
 #ifdef ENABLE_XF86_DGA
 		} else if (has_dga & sscanf(mode_str, "dga/%d/%d", &default_width, &default_height) == 2) {
 			display_type = DISPLAY_DGA;
+#endif
+#ifdef ENABLE_WSCONS_DGA
+		} else if (has_dga && strncmp(mode_str, "dga", 3) == 0) {
+			/*
+			 * Accept "dga", "dga/W/H" and anything else beginning
+			 * dga: the wscons backend always takes the whole
+			 * screen at the size the kernel reports, so the
+			 * geometry is not ours to choose.  Without this the
+			 * string matched nothing and fell through to a
+			 * window, which is why the DGA driver was never
+			 * constructed no matter what was asked for.
+			 */
+			display_type = DISPLAY_DGA;
+			default_width = -1; default_height = -1;
 #endif
 		}
 	}

@@ -172,7 +172,37 @@ on the target — `sigsegv_recovery` in particular, if VOSF is ever wanted.
 XFree86-DGA extension, which kdrive/tinyx does not. `ENABLE_FBDEV_DGA`
 needs no X extension, only the device — which is why it is the viable one.
 
-## The X server wedge (open)
+## Status: driver_wscons works; the guest faults at 0x2000
+
+The backend is exercised and sound.  With DGA actually selected the whole
+constructor runs and the X server survives:
+
+    vtrace: about to construct driver (type 1)
+    wstrace: constructor entered
+    wstrace: XCreateWindow returned
+    wstrace: XMapRaised done; entering wait_mapped
+    wstrace: wait_mapped returned          <- no hang
+    wstrace: grabs done
+    wstrace: mmap ok
+    wstrace: CONSTRUCTOR COMPLETE
+    mtrace: about to Start680x0 (guest begins)
+    Caught SIGSEGV at address 0x2000
+
+So: the window, the mode handling, the palette save, the grabs and the
+framebuffer mapping all work, `wait_mapped()` returns promptly, and the
+emulator reaches the point of starting the guest CPU.
+
+**Next: the guest faults at 0x2000**, immediately above the low memory
+area (0x0000-0x2000).  The low globals themselves ARE mapped -- the
+"Cannot map Low Memory Globals" error disappears once
+`vm.user_va0_disable=0` -- so this is about what lies just above them,
+i.e. where the guest's RAM is expected to be in real-addressing mode.
+
+`BII_CROSS_MAP_LOW_AREA` is a red herring: despite its description it
+feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
+NetBSD.
+
+## The X server wedge -- SOLVED, and it was never ours
 
 Running the emulator wedges Xwscons: it stops answering every client,
 xdpyinfo included.  The emulator's own symptom is a hang in
