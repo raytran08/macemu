@@ -1528,9 +1528,50 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 
 	// Map the framebuffer.  fbi_fboffset must be inside the mapping, not
 	// merely added afterwards, or the final page is past its end.
-	ws_maplen = (size_t)fbi.fbi_fboffset + (size_t)fbi.fbi_fbsize;
-	ws_map = (uint8 *)mmap(NULL, ws_maplen, PROT_READ | PROT_WRITE,
-		MAP_SHARED, ws_fd, 0);
+	/*
+	 * Map with slack past the visible framebuffer.
+	 *
+	 * fbi_fbsize is exactly the visible bytes -- 640*480 here -- and
+	 * fboffset+fbsize happens to land on a page boundary, so the first
+	 * byte the guest writes past the screen is on an unmapped page.
+	 * MacOS does write past it: the ROM's screen clear faulted at
+	 * precisely base+307200.  The card has more VRAM than the visible
+	 * mode uses, so ask for a whole 512KB and fall back to the exact
+	 * size if the kernel will not give it.
+	 */
+	/*
+	 * The kernel will not map past the visible framebuffer -- mac68k's
+	 * genfb_grfbus_mmap bounds-checks against sc_fbsize -- but MacOS
+	 * writes past it anyway: the ROM's screen clear faults at exactly
+	 * base + 640*480, the first byte beyond, because fboffset+fbsize
+	 * lands on a page boundary.
+	 *
+	 * So reserve a slightly larger region and back only the front of it
+	 * with the device.  Anonymous memory fills the tail, giving the
+	 * overrun somewhere harmless to go; those bytes are past the visible
+	 * screen and are never displayed.
+	 */
+	{
+		size_t fbbytes = (size_t)fbi.fbi_fboffset +
+		    (size_t)fbi.fbi_fbsize;
+		size_t slack = 64 * 1024;
+
+		ws_maplen = fbbytes + slack;
+		ws_map = (uint8 *)mmap(NULL, ws_maplen,
+		    PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+		if (ws_map != MAP_FAILED) {
+			if (mmap(ws_map, fbbytes, PROT_READ | PROT_WRITE,
+			    MAP_SHARED | MAP_FIXED, ws_fd, 0) == MAP_FAILED) {
+				munmap(ws_map, ws_maplen);
+				ws_map = (uint8 *)MAP_FAILED;
+			}
+		}
+		if (ws_map == MAP_FAILED) {	/* no slack; try plain */
+			ws_maplen = fbbytes;
+			ws_map = (uint8 *)mmap(NULL, ws_maplen,
+			    PROT_READ | PROT_WRITE, MAP_SHARED, ws_fd, 0);
+		}
+	}
 	if (ws_map == MAP_FAILED) {
 		char str[256];
 		sprintf(str, "Cannot mmap %lu bytes of %s: %s\n",
@@ -1560,7 +1601,21 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 		return;
 	}
 
-	WSTRACE("CONSTRUCTOR COMPLETE");
+	/*
+	 * Tell the guest where the screen actually is.
+	 *
+	 * Omitting this was the bug that corrupted the video driver: MacOS
+	 * was never given the frame buffer's address, wrote the screen to
+	 * whatever it had by default -- low RAM, where the Slot Manager had
+	 * just copied this very driver -- and overwrote the driver's own
+	 * code.  Execution survived on stale instruction-cache contents for
+	 * a couple of instructions and then ran into the wreckage.  Every
+	 * other backend does this; driver_wscons did not.
+	 */
+	set_mac_frame_buffer(monitor, mode.depth, true);
+
+	WSTRACE("CONSTRUCTOR COMPLETE (frame base %08x)",
+	    (unsigned)monitor.get_mac_frame_base());
 	init_ok = true;
 }
 

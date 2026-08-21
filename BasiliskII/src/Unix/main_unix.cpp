@@ -1563,6 +1563,25 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	uint16 opcode = *pc;
 
 	/*
+	 * TEMPORARY.  Record where the video driver's entry points actually
+	 * are, in the SAME run as any fault, so the driver base is measured
+	 * rather than inferred by chaining two runs together.
+	 * 0x7118/19/1a are VIDEO_OPEN / VIDEO_CONTROL / VIDEO_STATUS, whose
+	 * declared offsets in the slot ROM are 0x32 / 0x3a / 0x46.
+	 */
+	if (opcode >= 0x7118 && opcode <= 0x711a) {
+		static int v;
+
+		if (v < 12) {
+			static const int off[3] = { 0x32, 0x3a, 0x46 };
+			fprintf(stderr, "video op %04x at pc=%08x -> driver "
+			    "base %08x\n", (unsigned)opcode, (unsigned)sc_pc,
+			    (unsigned)sc_pc - off[opcode - 0x7118]);
+			v++;
+		}
+	}
+
+	/*
 	 * TEMPORARY.  This handler is the whole of native 68k mode: every
 	 * privileged instruction and every A-trap the guest executes lands
 	 * here.  Its machine-context access was rewritten for ucontext, so
@@ -1840,6 +1859,24 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 
 		default:
 ill:		{	/* TEMPORARY: what does memory around PC actually hold? */
+			/*
+			 * Dump the whole driver as copied into RAM, from its
+			 * base, so it can be compared byte-for-byte with what
+			 * slot_rom.cpp emits.  Control's escape is at 0x3a and
+			 * we fault at 0x3c, so base = pc - 0x3c.
+			 */
+			uint16 *drv = (uint16 *)(((uint32)sc_pc & ~1) - 0x3c);
+			printf("driver as copied, base %08x, 0x72 bytes:\n",
+			    (unsigned)(uint32)drv);
+			for (int r = 0; r < 15; r++) {
+				printf("  +%02x:", r * 8);
+				for (int c = 0; c < 4; c++)
+					printf(" %04x", (unsigned)drv[r*4+c]);
+				printf("\n");
+			}
+			printf("source: +30 flags/offsets, +32 OPEN 4e75, "
+			    "+36 70ff 600e, +3a CTRL 0c68 0001 001a 6604 4e75, "
+			    "+46 STAT ...\n");
 			uint16 *w = (uint16 *)((uint32)sc_pc & ~1);
 			printf("memory around pc:\n");
 			for (int r = -4; r < 6; r++) {
