@@ -1347,6 +1347,18 @@ driver_fbdev::~driver_fbdev()
 
 const char WSCONS_DEVICE_FILE_NAME[] = "/dev/ttyE0";
 
+/*
+ * TEMPORARY -- remove once the server wedge is found.
+ *
+ * stderr, not printf: stdout is block-buffered when redirected to a file,
+ * so traces from earlier attempts died in the buffer when the process was
+ * killed and every log came back empty.
+ */
+#define WSTRACE(...) do { \
+	fprintf(stderr, "wstrace: " __VA_ARGS__); \
+	fputc('\n', stderr); \
+} while (0)
+
 class driver_wscons : public driver_dga {
 public:
 	driver_wscons(X11_monitor_desc &monitor);
@@ -1388,6 +1400,7 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 	int wsmode;
 
 	// Set absolute mouse mode
+	WSTRACE("constructor entered");
 	ADBSetRelMouseMode(false);
 
 	const char *ws_path = PrefsFindString("wsconsdevice");
@@ -1479,6 +1492,7 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 				strerror(errno)));
 	}
 
+	WSTRACE("fbinfo, mode and palette done; creating window");
 	// Create window
 	XSetWindowAttributes wattr;
 	wattr.event_mask = eventmask = dga_eventmask;
@@ -1493,17 +1507,24 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 		(fbi.fbi_bitsperpixel <= 8 ? CWColormap : 0),
 		&wattr);
 
+	WSTRACE("XCreateWindow returned");
 	set_window_name(w, false);
+	WSTRACE("set_window_name done");
 	set_window_focus(w);
+	WSTRACE("set_window_focus done");
 	XMapRaised(x_display, w);
+	WSTRACE("XMapRaised done; entering wait_mapped");
 	wait_mapped(w);
+	WSTRACE("wait_mapped returned");
 
 	XGrabKeyboard(x_display, w, True,
 		GrabModeAsync, GrabModeAsync, CurrentTime);
 	XGrabPointer(x_display, w, True,
 		PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
 		GrabModeAsync, GrabModeAsync, w, None, CurrentTime);
+	WSTRACE("grabs done");
 	disable_mouse_accel();
+	WSTRACE("disable_mouse_accel done");
 
 	// Map the framebuffer.  fbi_fboffset must be inside the mapping, not
 	// merely added afterwards, or the final page is past its end.
@@ -1519,6 +1540,7 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 		return;
 	}
 
+	WSTRACE("mmap ok");
 	the_buffer = ws_map + fbi.fbi_fboffset;
 	the_buffer_size = (uint32)fbi.fbi_fbsize;
 
@@ -1538,6 +1560,7 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 		return;
 	}
 
+	WSTRACE("CONSTRUCTOR COMPLETE");
 	init_ok = true;
 }
 

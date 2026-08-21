@@ -205,9 +205,28 @@ interesting -- the emulator's threads and its 60 Hz signal traffic, since
 Xlib is not thread-safe without `XInitThreads` and the native 68k build
 takes `SIGALRM` and `SIG_IRQ` constantly.
 
-The next step is to instrument the real driver rather than build more
-synthetic stages: print through the constructor and see how far it gets
-before the server stops answering.
+**Instrumenting the driver settled it: the wedge is not ours.**  Traces
+were added through the whole `driver_wscons` constructor, on stderr so
+nothing could be lost to buffering when the process is killed.  The trace
+file came back EMPTY while the server wedged anyway -- the constructor
+never executed its first line.
+
+Confirmed from the other direction by running `--screen win/640/480`,
+where `driver_wscons` is never constructed at all.  X wedges just the
+same.
+
+So the cause is generic to Basilisk II on this machine and has nothing to
+do with the wscons backend, the framebuffer mapping, the colormaps or the
+display mode.  The remaining suspect is the emulator's interaction with
+Xlib under its own signal traffic: the native 68k build fields SIGALRM
+and SIG_IRQ continuously, Xlib is not thread-safe without
+`XInitThreads()`, and a signal taken part-way through writing a request
+leaves a partial request on the socket -- a server waiting for the rest
+of one is a plausible way for it to stop answering everybody.
+
+That is a hypothesis and has NOT been tested.  The cheap experiments are
+to call `XInitThreads()` early, and to block SIG_IRQ/SIGALRM around Xlib
+calls, and see whether either changes the outcome.
 
 Note the first version of the bisect produced a meaningless "all stages
 passed": it called `XSetInputFocus` on an unmapped window, which is
