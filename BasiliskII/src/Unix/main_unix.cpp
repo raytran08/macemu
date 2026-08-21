@@ -1489,6 +1489,32 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	if (EmulatedSR & 0x0700)
 		return;
 
+	/*
+	 * Only interrupt the GUEST.  This signal arrives on a timer and can
+	 * land anywhere -- inside the emulator's own code, inside libc, or
+	 * in another thread entirely -- and the EmulatedSR mask above only
+	 * covers EmulOp.  Injecting a Mac interrupt frame in those cases
+	 * captures a HOST pc as though it were guest code; MacOS later
+	 * RTEs to it and jumps into nowhere.
+	 *
+	 * Observed exactly that: a frame with a plausible SR (0x2010, which
+	 * is sc_ps|EmulatedSR from right here) and pc=0x0c51c5a0, an address
+	 * on the host heap between our text at 0x08000000 and the mapping
+	 * arena at 0x10000000.
+	 *
+	 * Guest code lives in RAM from 0 and ROM immediately above it, so
+	 * anything outside that is not ours to interrupt.  Dropping the tick
+	 * is harmless: another arrives in 1/60s.
+	 */
+	if ((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) {
+		static int dropped;
+
+		if (dropped < 5)
+			fprintf(stderr, "sigirq: not in guest (pc=%08x), "
+			    "tick dropped\n", (unsigned)sc_pc), dropped++;
+		return;
+	}
+
 
 	// Set up interrupt frame on stack
 	uint32 a7 = regs->a[7];
@@ -1813,7 +1839,20 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 			break;
 
 		default:
-ill:		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
+ill:		{	/* TEMPORARY: what does memory around PC actually hold? */
+			uint16 *w = (uint16 *)((uint32)sc_pc & ~1);
+			printf("memory around pc:\n");
+			for (int r = -4; r < 6; r++) {
+				printf("  %08x:", (unsigned)((uint32)w + r * 8));
+				for (int c = 0; c < 4; c++)
+					printf(" %04x",
+					    (unsigned)w[r * 4 + c]);
+				printf("\n");
+			}
+			printf("expected at Control(): 7119 0c68 0001 001a "
+			    "6604 4e75\n");
+		}
+		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
 			printf(" context %p:\n", (void *)ucp);
 			printf("  uc_flags %08x\n", (unsigned)ucp->uc_flags);
 			printf("  sp %08x\n", sc_sp);

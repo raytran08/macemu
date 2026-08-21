@@ -274,6 +274,46 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
+## Status: boots deep, then executes unmapped-space fill
+
+Real fix landed: **the 60Hz interrupt was corrupting non-guest context.**
+`sigirq_handler` fires on a timer and can land anywhere -- inside the
+emulator, inside libc, in another thread -- and the `EmulatedSR & 0x0700`
+guard only covers EmulOp.  When it landed outside guest code it built a
+Mac interrupt frame containing a HOST pc; MacOS later RTE'd to it and
+jumped into nowhere.  Caught red-handed: a frame with SR 0x2010 (exactly
+`sc_ps|EmulatedSR` from that handler) and pc 0x0c51c5a0, an address in
+the host's shared-library region.  It now declines to interrupt anything
+outside RAM+ROM and drops the tick; another arrives in 1/60s.
+
+With that, the emulator no longer crashes on the RTE path and exits
+cleanly.
+
+**Remaining fault.**  The guest still walks into a region around
+0x5f80-0x5fc0 filled entirely with `0xff00`:
+
+    00005f8c: ff00 ff00 ff00 ff00
+    expected at Control(): 7119 0c68 0001 001a 6604 4e75
+
+`0xff00` repeated is the signature of reads from unmapped address space
+floating high, not of anonymous guest RAM (which is zero-filled).  The
+faulting opcode is `0xff00` (F-line) and the address we chased for hours,
+`0xff00ff00`, is simply two of those words read as a pointer.
+
+The code that *should* be there is the video driver's Control routine
+from the slot declaration ROM (`slot_rom.cpp`), which emits
+`M68K_EMUL_OP_VIDEO_CONTROL` followed by real 68k code and is copied to
+`ROMBaseHost + ROMSize - slot_rom_size`.  That placement was verified as
+correct.
+
+A bootable disk was supplied and transferred (200MB `Applesex.hfv`, HFS,
+volume "Macintosh HD", System + MacsBug boot blocks) and does NOT change
+the outcome -- so the fault is not "nothing to boot from".
+
+**Next lead**: whether the guest's reads of NuBus slot space are mapped
+at all.  The `0xff00` float pattern is what unmapped bus reads look like,
+and the video driver lives in slot space before MacOS copies it out.
+
 ## Status: Mac OS boots deep into ROM, then a bad exception return
 
 The guest gets a long way.  Instrumenting `sigill_handler` -- where every
