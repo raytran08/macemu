@@ -274,43 +274,50 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
-## Status: guest executes; EMUL_OP dispatch loops
+## Status: Mac OS boots deep into ROM, then a bad exception return
 
-Native 68k execution works.  The guest runs Mac ROM code on the 68040 and
-its traps reach `sigill_handler`, which is the whole of the mechanism --
-every privileged instruction and every EMUL_OP escape lands there.
+The guest gets a long way.  Instrumenting `sigill_handler` -- where every
+privileged instruction and EMUL_OP escape lands -- counts **3453 traps
+across 244 distinct PCs** before the failure, and the mix near the end is
+real Mac OS startup:
 
-Instrumenting that handler shows the failure exactly:
+    op=7129  EMUL_OP        op=4e73  RTE
+    op=f4f8  CPUSHA         op=a029, a055  A-traps
+    pc=00005f8a             <- executing code copied into RAM
 
-    sigill[0]: pc=0080008c op=7103 sr=0000 a7=00008000   <- dispatched
-    sigill[1]: pc=008b35c6 op=7104 sr=0008 a7=00007e98
-    sigill[2]: pc=008b35c6 op=7104 sr=0008 a7=00007e98   <- identical
-    ... forever
+**Two earlier claims here were wrong and are retracted.**
 
-`0x71xx` are Basilisk II's EMUL_OP escapes: illegal MOVEQ encodings
-patched into the ROM so it traps out to native code.  One dispatched and
-the guest moved on; the next loops on the same PC and never advances.
-The eventual `SIGSEGV at 0xff00ff00 [IP=0xff00ff00]` is the aftermath.
+*"EMUL_OP dispatch loops without advancing."*  It does not.  The repeated
+PC was the ROM walking XPRAM in a tight loop -- `CLKNOMEM` showed `d1`
+incrementing (`0x000000b8`, `0x000004b8`, `0x000008b8`), which decodes to
+register 0, 1, 2.  Normal behaviour, not a hang.
 
-**`a7` is the tell.**  The EMUL_OP path pushes PC, SR and all sixteen
-registers onto the guest stack (~72 bytes) and then redirects `sc_pc` to
-`EmulOpTrampoline`, which does `addql #2,a0@(66)` -- offset 66 being the
-saved PC for that push order -- to step past the two-byte escape.  If any
-of that were happening, `a7` would move.  It does not budge across every
-repeat, so the register saves are not taking effect and the PC is never
-advanced.
+*"a7 never changes, so the register saves are not taking effect."*  Also
+wrong: `EmulOpTrampoline` ends `moveml sp@+,d0-d7/a0-a6` / `addql #4,sp`
+/ `rtr`, restoring the stack it was given.  `a7` returning to its former
+value is what success looks like.  Tracing confirmed the push does happen
+(70 bytes) and the PC is stored at offset 66 where the trampoline expects
+it.  The ucontext port of the handler is working.
 
-Prime suspect is this port's own rewrite of the handler's machine-context
-access from `struct sigcontext` to `ucontext`.  One consequence deserves
-scrutiny: `sc_sp` and `regs->a[7]` were separate storage before and are
-now the same location, so `sc_sp = regs->a[7] = a7` writes one place
-where it used to write two.  That is believed harmless but is unproven,
-and the loop is consistent with the guest's A7 not being updated.
+**The actual failure** is an exception return to a nonsense address:
 
-The next test is narrow: confirm whether writes to `uc_mcontext.__gregs`
-inside the handler are honoured on return at all -- the first trap
-suggests yes, the rest suggest no, and that contradiction is the thread
-to pull.
+    RTE to implausible pc=0c51c5a0 (sr=2010 format=0 adj=0
+                                    oldA7=0040fb58 newA7=0040fb60)
+    Caught SIGSEGV at address 0xff00ff00 [IP=0xff00ff00]
+
+The popped SR (`0x2010`) is plausible; the PC is not.  RTE consumed 8
+bytes, correct for a format-0 frame.
+
+Both emulated exception pushes were checked and are correct 8-byte
+format-0 frames: the A-line path writes vector word `0x28`, then PC, then
+SR; the interrupt path writes `0x64`, PC, SR.  So the frame layout is not
+the bug.
+
+**Next**: find who wrote that frame.  Either something corrupts the guest
+stack earlier, or an exception is taken on a path that does not build a
+frame at all.  Worth checking the interrupt path specifically --
+`sigirq_handler` was also ported to ucontext, fires at 60Hz, and pushes
+onto whatever stack the guest happens to be using.
 
 ## Status: the guest executes; it faults early in ROM startup
 

@@ -1546,7 +1546,7 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	{
 		static int ill_count;
 
-		if (ill_count < 24) {
+		if (ill_count < 0) {
 			fprintf(stderr, "sigill[%d]: pc=%08x op=%04x sr=%04x "
 			    "a7=%08x\n", ill_count, (unsigned)sc_pc,
 			    (unsigned)opcode, (unsigned)sc_ps,
@@ -1602,6 +1602,16 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 
 		// Jump to EmulOp trampoline code on return
 		sc_pc = (uint32)EmulOpTrampoline;
+		{	/* TEMPORARY */
+			static int t;
+			if (t < 0) {
+				fprintf(stderr, "  EMUL_OP branch: new a7=%08x "
+				    "trampoline=%08x saved_pc@66=%08x\n",
+				    (unsigned)a7, (unsigned)sc_pc,
+				    (unsigned)ReadMacInt32(a7 + 66));
+				t++;
+			}
+		}
 		
 	} else switch (opcode) {	// Emulate privileged instructions
 
@@ -1727,6 +1737,20 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 				0, 0, 4, 4, 8, 0, 0, 52, 50, 12, 24, 84, 16, 0, 0, 0
 			};
 			sc_sp = regs->a[7] = a7 + frame_adj[format];
+			/*
+			 * TEMPORARY.  The guest dies jumping to 0xff00ff00
+			 * right after an RTE, so report any exception return
+			 * to an address that cannot be code: guest RAM is
+			 * 0..RAMSize and ROM sits just above it.
+			 */
+			if ((uint32)sc_pc >= 0x00900000u)
+				fprintf(stderr, "  RTE to implausible pc=%08x "
+				    "(sr=%04x format=%x adj=%d oldA7=%08x "
+				    "newA7=%08x)\n", (unsigned)sc_pc,
+				    (unsigned)sr, (unsigned)format,
+				    frame_adj[format],
+				    (unsigned)regs->a[7] - frame_adj[format] - 8,
+				    (unsigned)sc_sp);
 			break;
 		}
 
