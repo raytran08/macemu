@@ -839,30 +839,68 @@ int main(int argc, char **argv)
 
 	// Initialize everything
 	/*
-	 * EXPERIMENT: also place the ROM where it lives on real hardware.
+	 * Also make the ROM visible where it lives on real hardware.
 	 *
-	 * This Quadra ROM contains absolute references to 0x40800000, the
+	 * This Quadra ROM holds absolute references to 0x40800000, the
 	 * physical ROM base on mac68k (ROMBASE in machine/cpu.h), because
 	 * that is where it sits on the machine it was written for -- which
 	 * is the machine we are running on.  The low-memory ROMBase global
-	 * is correct (0x00800000) and the guest still reached 0x408266b4,
-	 * so these are baked-in constants rather than a computed base.
+	 * is correct at 0x00800000 and the guest still reached 0x408266b4,
+	 * so these are constants baked into the ROM, not a computed base.
 	 *
-	 * Every other host has to patch them.  Here we can simply satisfy
-	 * them: map anonymous memory at 0x40800000 and put a second copy of
-	 * the ROM there.
+	 * The two addresses must be the SAME memory, not two copies.  MacOS
+	 * patches its ROM in place while starting up, and with independent
+	 * copies a patch written through one address is invisible from the
+	 * other, so code running from 0x40800000 would execute unpatched --
+	 * which is what a boot that reaches the welcome screen and then
+	 * wanders off looks like.
+	 *
+	 * So back both with one shared object: a temporary file, unlinked
+	 * immediately, mapped MAP_SHARED at each address.
 	 */
 	{
-		void *hw = mmap((void *)0x40800000, ROMSize,
-		    PROT_READ | PROT_WRITE,
-		    MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+		char tmpl[] = "/tmp/BasiliskII-rom.XXXXXX";
+		int rfd = mkstemp(tmpl);
 
-		if (hw == MAP_FAILED)
-			fprintf(stderr, "warning: could not map ROM at its "
-			    "hardware address 0x40800000: %s\n",
-			    strerror(errno));
-		else
-			memcpy(hw, ROMBaseHost, ROMSize);
+		if (rfd < 0)
+			fprintf(stderr, "warning: no backing file for the "
+			    "hardware ROM alias: %s\n", strerror(errno));
+		else {
+			(void)unlink(tmpl);
+			if (ftruncate(rfd, ROMSize) < 0) {
+				fprintf(stderr, "warning: ftruncate for ROM "
+				    "alias: %s\n", strerror(errno));
+				close(rfd);
+			} else {
+				void *lo, *hi;
+				uint8 *keep = (uint8 *)malloc(ROMSize);
+
+				/*
+				 * The ROM has already been read into
+				 * ROMBaseHost, and mapping over those pages
+				 * discards them, so keep a copy across the
+				 * remap and write it back afterwards.
+				 */
+				if (keep != NULL)
+					memcpy(keep, ROMBaseHost, ROMSize);
+
+				lo = mmap(ROMBaseHost, ROMSize,
+				    PROT_READ | PROT_WRITE,
+				    MAP_SHARED | MAP_FIXED, rfd, 0);
+				hi = mmap((void *)0x40800000, ROMSize,
+				    PROT_READ | PROT_WRITE,
+				    MAP_SHARED | MAP_FIXED, rfd, 0);
+				if (lo == MAP_FAILED || hi == MAP_FAILED ||
+				    keep == NULL)
+					fprintf(stderr, "warning: could not "
+					    "alias ROM at 0x40800000: %s\n",
+					    strerror(errno));
+				else
+					memcpy(lo, keep, ROMSize);
+				free(keep);
+				close(rfd);
+			}
+		}
 	}
 
 	if (!InitAll(vmdir))

@@ -291,7 +291,18 @@ branch.
 guest gets roughly two thirds of its 60Hz interrupts.  That was the
 leading theory and it is wrong.
 
-**Leading suspect is the 0x40800000 ROM mapping**, added here.  The ROM
+**Tested and eliminated: the 0x40800000 ROM mapping.**  It is now a
+genuine alias -- one temporary file, unlinked, mapped MAP_SHARED at both
+0x800000 and 0x40800000, so a patch through either address is visible
+from the other.  Both mappings succeed and the fault is unchanged.  Worth
+keeping regardless, since two copies able to diverge is a latent bug, but
+it is not the cause.
+
+The fault is **deterministic**: 0x9fc0000 on every run, never a different
+address.  Random corruption would scatter; something computes exactly
+that value each time, which should make it findable.
+
+The earlier reasoning, now disproved, was:  The ROM
 now exists twice: at 0x800000 where Basilisk II places it, and at
 0x40800000 as a `MAP_ANON | MAP_PRIVATE` copy satisfying the ROM's
 baked-in absolute references.  Those are independent pages.  MacOS
