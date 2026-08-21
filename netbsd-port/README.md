@@ -274,6 +274,56 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
+## Status: IT BOOTS
+
+Mac OS starts on the Centris 650 and reaches "Welcome to Macintosh" --
+the ROM finds the disk, loads the System file and hands control to it.
+The guest runs natively on the 68040 with `driver_wscons` drawing
+straight into the wscons framebuffer.  10317 traps, zero faults, over a
+sustained run.
+
+What it took, after the port would build:
+
+1. **`--screen dga` never parsed.**  `video_x.cpp` accepts `dga/...` only
+   under the other two backends, so every run silently used the windowed
+   driver.  That alone accounted for days of confusing evidence.
+2. **The image was linked on top of the guest.**  NetBSD/m68k links at
+   0x2000, exactly where guest RAM must start; and then 0x10000000
+   collided with `MAP_BASE`, the emulator's own mapping arena, so
+   `vm_acquire_mac` mapped scratch memory over our text.  0x08000000 sits
+   clear of both.
+3. **The 60Hz tick corrupted non-guest context**, injecting Mac interrupt
+   frames holding host PCs.
+4. **`driver_wscons` never called `set_mac_frame_buffer()`**, so MacOS
+   was never told where the screen is and drew over the video driver in
+   low RAM.  This was ours, and the single most damaging omission.
+5. **MacOS writes past the end of the screen.**  The kernel will not map
+   beyond `sc_fbsize`, so the mapping is reserved with anonymous slack
+   behind the device pages to absorb it.
+6. **The ROM holds absolute references to 0x40800000**, its physical base
+   on real hardware.  Unusually for this port, the guest *is* running on
+   that hardware, so a second copy of the ROM is simply mapped there.
+
+### Known issue: two cursors
+
+`startxws` defaults to `-kcursor`, so `dafbcons` draws the X pointer into
+the framebuffer from the vblank interrupt -- and a DGA guest owns that
+framebuffer.  The Mac cursor appears briefly and is then repainted over
+on any mouse movement.  `KCURSOR=no startxws` avoids it.
+
+The proper fix is for `driver_wscons` to stand the kernel cursor down
+while it holds the display, the same save/take-over/restore it already
+does for the palette, through the `hw.dafbcons.cursor` sysctl.  Then
+`-kcursor` can stay default for ordinary X use, where it is what fixed
+pointer tearing.
+
+### Still to do
+
+Pare back the temporary instrumentation in `main_unix.cpp` and
+`video_x.cpp` -- extensive, marked TEMPORARY, and it earned its keep.
+Revisit the 0x40800000 mapping, which suits this machine rather than
+being a general patch.
+
 ## Status: driver_wscons proven; guest dies in a truncated driver copy
 
 **driver_wscons coexists with X correctly.**  Tested with the DGA path

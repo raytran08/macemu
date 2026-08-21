@@ -305,6 +305,10 @@ static void sigsegv_dump_state(sigsegv_info_t *sip)
 {
 	const sigsegv_address_t fault_address = sigsegv_get_fault_address(sip);
 	const sigsegv_address_t fault_instruction = sigsegv_get_fault_instruction_address(sip);
+	/* TEMPORARY: where does the guest think the ROM is? */
+	fprintf(stderr, "lowmem: ROMBase[0x2ae]=%08x  ROMBaseMac=%08x  "
+	    "RAMBaseMac=%08x\n", (unsigned)ReadMacInt32(0x2ae),
+	    (unsigned)ROMBaseMac, (unsigned)RAMBaseMac);
 	fprintf(stderr, "Caught SIGSEGV at address %p", fault_address);
 	if (fault_instruction != SIGSEGV_INVALID_ADDRESS)
 		fprintf(stderr, " [IP=%p]", fault_instruction);
@@ -915,6 +919,35 @@ int main(int argc, char **argv)
 #endif
 
 	// Initialize everything
+	/*
+	 * EXPERIMENT: also place the ROM where it lives on real hardware.
+	 *
+	 * This Quadra ROM contains absolute references to 0x40800000, the
+	 * physical ROM base on mac68k (ROMBASE in machine/cpu.h), because
+	 * that is where it sits on the machine it was written for -- which
+	 * is the machine we are running on.  The low-memory ROMBase global
+	 * is correct (0x00800000) and the guest still reached 0x408266b4,
+	 * so these are baked-in constants rather than a computed base.
+	 *
+	 * Every other host has to patch them.  Here we can simply satisfy
+	 * them: map anonymous memory at 0x40800000 and put a second copy of
+	 * the ROM there.
+	 */
+	{
+		void *hw = mmap((void *)0x40800000, ROMSize,
+		    PROT_READ | PROT_WRITE,
+		    MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+
+		if (hw == MAP_FAILED)
+			fprintf(stderr, "mtrace: could not map ROM at "
+			    "0x40800000: %s\n", strerror(errno));
+		else {
+			memcpy(hw, ROMBaseHost, ROMSize);
+			fprintf(stderr, "mtrace: ROM also mapped at "
+			    "0x40800000 (%u bytes)\n", (unsigned)ROMSize);
+		}
+	}
+
 	fprintf(stderr, "mtrace: ROM read ok; entering InitAll\n");
 	if (!InitAll(vmdir))
 		QuitEmulator();
@@ -1591,7 +1624,7 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	{
 		static int ill_count;
 
-		if (ill_count < 0) {
+		if (ill_count < 20000) {
 			fprintf(stderr, "sigill[%d]: pc=%08x op=%04x sr=%04x "
 			    "a7=%08x\n", ill_count, (unsigned)sc_pc,
 			    (unsigned)opcode, (unsigned)sc_ps,
