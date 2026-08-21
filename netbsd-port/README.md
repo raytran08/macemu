@@ -192,7 +192,35 @@ So: the window, the mode handling, the palette save, the grabs and the
 framebuffer mapping all work, `wait_mapped()` returns promptly, and the
 emulator reaches the point of starting the guest CPU.
 
-**Next: the guest faults at 0x2000**, immediately above the low memory
+**SOLVED: the guest faulted at 0x2000 because that is where WE were.**
+`objdump -p` showed the executable's first LOAD segment at vaddr 0x2000
+-- exactly the fault address.  NetBSD/m68k links there by default, so the
+emulator's own read-only text sat precisely where the guest's RAM must
+begin, and a natively executing guest hit it immediately.
+
+configure has machinery for this (`LINKER_SCRIPT_FLAGS`) with entries for
+Linux i386/ppc, FreeBSD i386 and NetBSD i386 -- but none for m68k, so
+`HAVE_LINKER_SCRIPT` was undefined and `can_map_all_memory` was false.
+A `netbsd*:m68k` case using `-Wl,-Ttext-segment=0x10000000` moves the
+image clear; no script file is needed. Verified: the binary now loads at
+0x10000000 and `HAVE_LINKER_SCRIPT` is defined.
+
+**Now: SIGILL during startup, right after XOpenDisplay.**  The relocated
+binary itself is sound -- `--help` runs and exits 0 -- so the image is not
+corrupt.  What changed is behaviour: with `HAVE_LINKER_SCRIPT` defined,
+`can_map_all_memory` is true and startup takes the
+`vm_acquire_mac_fixed(0, RAMSize + ROM_MAX_SIZE)` path for the first
+time, mapping the guest's RAM and ROM from address zero.  Everything
+before that point is identical to the run that previously reached
+`Start680x0`.
+
+Worth noting `sigill_handler` is deliberate in native 68k mode -- it is
+how EMUL_OP and A-traps are dispatched -- but it is installed well after
+this point, so an early SIGILL is fatal rather than handled.
+
+The old note follows, kept because the reasoning still applies:
+
+**The guest faulted at 0x2000**, immediately above the low memory
 area (0x0000-0x2000).  The low globals themselves ARE mapped -- the
 "Cannot map Low Memory Globals" error disappears once
 `vm.user_va0_disable=0` -- so this is about what lies just above them,

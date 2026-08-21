@@ -1455,6 +1455,12 @@ case $target_os:$target_cpu in
 linux*:i?86)    LINKER_SCRIPT_FLAGS="-Wl,-T,ldscripts/linux-i386.ld";;
 linux*:powerpc) LINKER_SCRIPT_FLAGS="-Wl,-T,ldscripts/linux-ppc.ld";;
 netbsd*:i?86)   LINKER_SCRIPT_FLAGS="-Wl,-T,ldscripts/linux-i386.ld";;
+dnl NetBSD/m68k links at 0x2000 by default, which is exactly where the
+dnl guest's RAM has to start -- the emulator's own text sits on top of it
+dnl and a natively executing guest faults at 0x2000 the moment it runs.
+dnl Move the image well clear so 0x0000 upwards belongs to the Mac.  No
+dnl script file is needed for this; the segment address alone does it.
+netbsd*:m68k)   LINKER_SCRIPT_FLAGS="-Wl,-Ttext-segment=0x10000000";;
 freebsd*:i?86)  LINKER_SCRIPT_FLAGS="-Wl,-T,ldscripts/freebsd-i386.ld";;
 #darwin*:*)      LINKER_SCRIPT_FLAGS="-Wl,-seg1addr,0x78048000";;
 esac
