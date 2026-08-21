@@ -745,8 +745,16 @@ void driver_base::update_palette(void)
 		int num = vis->map_entries;
 		if (!IsDirectMode(monitor.get_current_mode()) && color_class == DirectColor)
 			return; // Indexed mode on true color screen, don't set CLUT
+#ifndef ENABLE_WSCONS_DGA
+		/*
+		 * Skipped for wscons DGA: the colormaps are AllocNone there,
+		 * because kdrive cannot make writable ones, so storing into
+		 * them is BadAccess.  driver_wscons puts these colours into
+		 * the hardware CLUT directly instead.
+		 */
 		XStoreColors(x_display, cmap[0], x_palette, num);
 		XStoreColors(x_display, cmap[1], x_palette, num);
+#endif
 	}
 	XSync(x_display, false);
 }
@@ -1539,8 +1547,12 @@ driver_wscons::~driver_wscons()
 // MacOS has changed its colours: push them to the hardware CLUT.
 void driver_wscons::update_palette(void)
 {
-	driver_dga::update_palette();
-
+	/*
+	 * Deliberately NOT chaining to driver_dga::update_palette(): that
+	 * ends in XStoreColors, which needs the writable colormap this
+	 * server cannot give us.  The colours go to the hardware below
+	 * instead, which is where they have to end up regardless.
+	 */
 	if (ws_fd < 0)
 		return;
 
@@ -1817,8 +1829,25 @@ bool X11_monitor_desc::video_open(void)
 
 	// Create color maps
 	if (color_class == PseudoColor || color_class == DirectColor) {
+#ifdef ENABLE_WSCONS_DGA
+		/*
+		 * AllocAll asks for a private, fully writable colormap, and
+		 * kdrive/tinyx does not implement it -- it answers BadMatch
+		 * even on a PseudoColor depth-8 visual, where AllocNone
+		 * succeeds.  That killed the server before any of this
+		 * driver ran.
+		 *
+		 * Nothing here needs it.  driver_wscons programs the hardware
+		 * CLUT itself through WSDISPLAYIO_PUTCMAP, so these colormaps
+		 * exist only to satisfy the window attributes; read-only ones
+		 * do that just as well.
+		 */
+		cmap[0] = XCreateColormap(x_display, rootwin, vis, AllocNone);
+		cmap[1] = XCreateColormap(x_display, rootwin, vis, AllocNone);
+#else
 		cmap[0] = XCreateColormap(x_display, rootwin, vis, AllocAll);
 		cmap[1] = XCreateColormap(x_display, rootwin, vis, AllocAll);
+#endif
 	} else {
 		cmap[0] = XCreateColormap(x_display, rootwin, vis, AllocNone);
 		cmap[1] = XCreateColormap(x_display, rootwin, vis, AllocNone);
@@ -1867,8 +1896,16 @@ bool X11_monitor_desc::video_open(void)
 		x_palette[i].blue = c * 0x0101;
 	}
 	if (color_class == PseudoColor || color_class == DirectColor) {
+#ifndef ENABLE_WSCONS_DGA
+		/*
+		 * Skipped for wscons DGA: the colormaps are AllocNone there,
+		 * because kdrive cannot make writable ones, so storing into
+		 * them is BadAccess.  driver_wscons puts these colours into
+		 * the hardware CLUT directly instead.
+		 */
 		XStoreColors(x_display, cmap[0], x_palette, num);
 		XStoreColors(x_display, cmap[1], x_palette, num);
+#endif
 	}
 
 #ifdef ENABLE_VOSF
