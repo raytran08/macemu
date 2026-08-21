@@ -274,6 +274,35 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
+## Status: the guest executes; it faults early in ROM startup
+
+Startup now runs to completion and hands control to the 68040:
+
+    mtrace: ScratchMem=0x10008000
+    mtrace: reading ROM to 0x800000 size 1048576
+    mtrace: ROM read ok; entering InitAll
+    wstrace: CONSTRUCTOR COMPLETE
+    mtrace: InitAll returned
+    mtrace: installing signal handlers
+    mtrace: about to Start680x0 (guest begins)
+    Caught SIGSEGV at address 0xff00ff00 [IP=0xff00ff00]
+
+IP equals the fault address, so the guest **jumped** there rather than
+reading it -- it branched through a pointer holding `0xff00ff00`, a fill
+pattern rather than a real address.  `0xff00ff00` appears nowhere in the
+source, so it came from memory the ROM read.
+
+The ROM itself is fine: its version word is `0x067c`, which is exactly
+`ROM_VERSION_32`, so `CheckROM()` passes and the patches apply.
+
+Entry is `Start680x0` in `asm_support.s`: guest stack at RAMBase+0x8000,
+then `jmp (a0)` with `a0 = ROMBaseHost + 0x2a`.  So the ROM runs from
+0x80002a and faults later, somewhere in its own startup.
+
+Next: find how far the ROM gets.  `--break ADDRESS` sets a ROM
+breakpoint, and the patches in `rom_patches.cpp` are the place to look
+for whichever hardware probe is not being intercepted.
+
 ## The X server wedge -- SOLVED, and it was never ours
 
 Running the emulator wedges Xwscons: it stops answering every client,

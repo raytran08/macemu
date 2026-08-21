@@ -303,7 +303,18 @@ static void powerpc_decode_instruction(instruction_t *instruction, unsigned int 
 #endif
 #endif
 #if defined(__NetBSD__)
-#if (defined(i386) || defined(__i386__))
+#if (defined(m68k) || defined(__m68k__))
+/*
+ * m68k was missing here while i386, x86_64 and powerpc all had it, so a
+ * fault reported no instruction pointer at all -- which on a native 68k
+ * build means no way to tell where in the guest the fault happened.
+ * m68k/mcontext.h orders __gregs as d0-d7, a0-a7, PC, PS.
+ */
+#include <sys/ucontext.h>
+#define SIGSEGV_CONTEXT_REGS			(((ucontext_t *)scp)->uc_mcontext.__gregs)
+#define SIGSEGV_FAULT_INSTRUCTION		SIGSEGV_CONTEXT_REGS[_REG_PC]
+#define SIGSEGV_REGISTER_FILE			(SIGSEGV_REGISTER_TYPE *)SIGSEGV_CONTEXT_REGS
+#elif (defined(i386) || defined(__i386__))
 #include <sys/ucontext.h>
 #define SIGSEGV_CONTEXT_REGS			(((ucontext_t *)scp)->uc_mcontext.__gregs)
 #define SIGSEGV_FAULT_INSTRUCTION		SIGSEGV_CONTEXT_REGS[_REG_EIP]

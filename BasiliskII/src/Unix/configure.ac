@@ -1460,7 +1460,18 @@ dnl guest's RAM has to start -- the emulator's own text sits on top of it
 dnl and a natively executing guest faults at 0x2000 the moment it runs.
 dnl Move the image well clear so 0x0000 upwards belongs to the Mac.  No
 dnl script file is needed for this; the segment address alone does it.
-netbsd*:m68k)   LINKER_SCRIPT_FLAGS="-Wl,-Ttext-segment=0x10000000";;
+dnl
+dnl 0x08000000 is chosen between two fixed constraints, not arbitrarily.
+dnl Below it lies the guest: RAM from 0x0 plus ROM above that, so the
+dnl image must clear RAMSize + ROM_MAX_SIZE -- 128MB of headroom here.
+dnl Above it, vm_alloc.cpp hands out every other mapping from
+dnl MAP_BASE 0x10000000 upward, with MAP_FIXED.  Linking at 0x10000000
+dnl put the executable exactly on that arena: vm_acquire_mac() for the
+dnl scratch area mmap'd 64KB over our own text and the process then
+dnl executed whatever landed there.  ktrace caught it in one line --
+dnl   mmap(0x10000000,0x10000,...FIXED...) = 0x10000000
+dnl immediately before the fatal signal.
+netbsd*:m68k)   LINKER_SCRIPT_FLAGS="-Wl,-Ttext-segment=0x08000000";;
 freebsd*:i?86)  LINKER_SCRIPT_FLAGS="-Wl,-T,ldscripts/freebsd-i386.ld";;
 #darwin*:*)      LINKER_SCRIPT_FLAGS="-Wl,-seg1addr,0x78048000";;
 esac
