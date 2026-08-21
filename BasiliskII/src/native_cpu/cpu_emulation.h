@@ -56,12 +56,12 @@ static inline void *Mac2Mac_memcpy(uint32 dest, uint32 src, size_t n) {return me
 
 // 680x0 emulation functions
 struct M68kRegisters;
-extern void Start680x0(void);									// Reset and start 680x0
+extern "C" void Start680x0(void);									// Reset and start 680x0
 extern "C" void Execute68k(uint32 addr, M68kRegisters *r);		// Execute 68k code from EMUL_OP routine
 extern "C" void Execute68kTrap(uint16 trap, M68kRegisters *r);	// Execute MacOS 68k trap from EMUL_OP routine
 
 // Interrupt functions
-extern void TriggerInterrupt(void);								// Trigger interrupt (InterruptFlag must be set first)
+extern "C" void TriggerInterrupt(void);								// Trigger interrupt (InterruptFlag must be set first)
 extern void TriggerNMI(void);									// Trigger interrupt level 7
 
 #endif

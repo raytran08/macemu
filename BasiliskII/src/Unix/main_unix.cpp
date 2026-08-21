@@ -20,6 +20,13 @@
 
 #include "sysdeps.h"
 
+#if !EMULATED_68K
+// The native 68k handlers read and write the interrupted machine state
+// through the ucontext, struct sigcontext no longer being visible to
+// userland on NetBSD.
+#include <ucontext.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -220,8 +227,8 @@ static void *xpram_func(void *arg);
 static void *tick_func(void *arg);
 static void one_tick(...);
 #if !EMULATED_68K
-static void sigirq_handler(int sig, int code, struct sigcontext *scp);
-static void sigill_handler(int sig, int code, struct sigcontext *scp);
+static void sigirq_handler(int sig, siginfo_t *sip, void *uap);
+static void sigill_handler(int sig, siginfo_t *sip, void *uap);
 extern "C" void EmulOpTrampoline(void);
 #endif
 
@@ -855,8 +862,8 @@ int main(int argc, char **argv)
 	sigemptyset(&sigill_sa.sa_mask);	// Block virtual 68k interrupts during SIGILL handling
 	sigaddset(&sigill_sa.sa_mask, SIG_IRQ);
 	sigaddset(&sigill_sa.sa_mask, SIGALRM);
-	sigill_sa.sa_handler = (void (*)(int))sigill_handler;
-	sigill_sa.sa_flags = SA_ONSTACK;
+	sigill_sa.sa_sigaction = sigill_handler;
+	sigill_sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
 	if (sigaction(SIGILL, &sigill_sa, NULL) < 0) {
 		sprintf(str, GetString(STR_SIG_INSTALL_ERR), "SIGILL", strerror(errno));
 		ErrorAlert(str);
@@ -866,8 +873,8 @@ int main(int argc, char **argv)
 	// Install virtual 68k interrupt signal handler
 	sigemptyset(&sigirq_sa.sa_mask);
 	sigaddset(&sigirq_sa.sa_mask, SIGALRM);
-	sigirq_sa.sa_handler = (void (*)(int))sigirq_handler;
-	sigirq_sa.sa_flags = SA_ONSTACK | SA_RESTART;
+	sigirq_sa.sa_sigaction = sigirq_handler;
+	sigirq_sa.sa_flags = SA_ONSTACK | SA_RESTART | SA_SIGINFO;
 	if (sigaction(SIG_IRQ, &sigirq_sa, NULL) < 0) {
 		sprintf(str, GetString(STR_SIG_INSTALL_ERR), "SIG_IRQ", strerror(errno));
 		ErrorAlert(str);
@@ -1363,30 +1370,46 @@ static void *tick_func(void *arg)
  *  Virtual 68k interrupt handler
  */
 
-static void sigirq_handler(int sig, int code, struct sigcontext *scp)
+static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 {
+	/*
+	 * NetBSD stopped exposing struct sigcontext to userland (it is now
+	 * guarded by _LIBC || _KERNEL in m68k/signal.h), so the interrupted
+	 * 68k state comes from the ucontext instead.  m68k/mcontext.h lays
+	 * __gregs out as d0-d7 then a0-a7 then PC and PS, which is exactly
+	 * the order M68kRegisters expects, so regs can point straight at it.
+	 *
+	 * Note a7 and the stack pointer are now the same storage rather than
+	 * two fields that had to be kept in step; assigning both is harmless
+	 * and left alone to keep this diff readable.
+	 */
+	ucontext_t *ucp = (ucontext_t *)uap;
+	__greg_t *gr = ucp->uc_mcontext.__gregs;
+	__greg_t &sc_pc = gr[_REG_PC];
+	__greg_t &sc_ps = gr[_REG_PS];
+	__greg_t &sc_sp = gr[_REG_A7];
+	M68kRegisters *regs = (M68kRegisters *)&gr[_REG_D0];
+
 	// Interrupts disabled? Then do nothing
 	if (EmulatedSR & 0x0700)
 		return;
 
-	struct sigstate *state = (struct sigstate *)scp->sc_ap;
-	M68kRegisters *regs = (M68kRegisters *)&state->ss_frame;
 
 	// Set up interrupt frame on stack
 	uint32 a7 = regs->a[7];
 	a7 -= 2;
 	WriteMacInt16(a7, 0x64);
 	a7 -= 4;
-	WriteMacInt32(a7, scp->sc_pc);
+	WriteMacInt32(a7, sc_pc);
 	a7 -= 2;
-	WriteMacInt16(a7, scp->sc_ps | EmulatedSR);
-	scp->sc_sp = regs->a[7] = a7;
+	WriteMacInt16(a7, sc_ps | EmulatedSR);
+	sc_sp = regs->a[7] = a7;
 
 	// Set interrupt level
 	EmulatedSR |= 0x2100;
 
 	// Jump to MacOS interrupt handler on return
-	scp->sc_pc = ReadMacInt32(0x64);
+	sc_pc = ReadMacInt32(0x64);
 }
 
 
@@ -1395,24 +1418,40 @@ static void sigirq_handler(int sig, int code, struct sigcontext *scp)
  *  A-Trap and EMUL_OP opcodes
  */
 
-static void sigill_handler(int sig, int code, struct sigcontext *scp)
+static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 {
-	struct sigstate *state = (struct sigstate *)scp->sc_ap;
-	uint16 *pc = (uint16 *)scp->sc_pc;
+	/*
+	 * NetBSD stopped exposing struct sigcontext to userland (it is now
+	 * guarded by _LIBC || _KERNEL in m68k/signal.h), so the interrupted
+	 * 68k state comes from the ucontext instead.  m68k/mcontext.h lays
+	 * __gregs out as d0-d7 then a0-a7 then PC and PS, which is exactly
+	 * the order M68kRegisters expects, so regs can point straight at it.
+	 *
+	 * Note a7 and the stack pointer are now the same storage rather than
+	 * two fields that had to be kept in step; assigning both is harmless
+	 * and left alone to keep this diff readable.
+	 */
+	ucontext_t *ucp = (ucontext_t *)uap;
+	__greg_t *gr = ucp->uc_mcontext.__gregs;
+	__greg_t &sc_pc = gr[_REG_PC];
+	__greg_t &sc_ps = gr[_REG_PS];
+	__greg_t &sc_sp = gr[_REG_A7];
+	M68kRegisters *regs = (M68kRegisters *)&gr[_REG_D0];
+
+	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
-	M68kRegisters *regs = (M68kRegisters *)&state->ss_frame;
 
-#define INC_PC(n) scp->sc_pc += (n)
+#define INC_PC(n) sc_pc += (n)
 
-#define GET_SR (scp->sc_ps | EmulatedSR)
+#define GET_SR (sc_ps | EmulatedSR)
 
 #define STORE_SR(v) \
-	scp->sc_ps = (v) & 0xff; \
+	sc_ps = (v) & 0xff; \
 	EmulatedSR = (v) & 0xe700; \
 	if (((v) & 0x0700) == 0 && InterruptFlags) \
 		TriggerInterrupt();
 
-//printf("opcode %04x at %p, sr %04x, emul_sr %04x\n", opcode, pc, scp->sc_ps, EmulatedSR);
+//printf("opcode %04x at %p, sr %04x, emul_sr %04x\n", opcode, pc, sc_ps, EmulatedSR);
 
 	if ((opcode & 0xf000) == 0xa000) {
 
@@ -1424,10 +1463,10 @@ static void sigill_handler(int sig, int code, struct sigcontext *scp)
 		WriteMacInt32(a7, (uint32)pc);
 		a7 -= 2;
 		WriteMacInt16(a7, GET_SR);
-		scp->sc_sp = regs->a[7] = a7;
+		sc_sp = regs->a[7] = a7;
 
 		// Jump to MacOS A-Line handler on return
-		scp->sc_pc = ReadMacInt32(0x28);
+		sc_pc = ReadMacInt32(0x28);
 
 	} else if ((opcode & 0xff00) == 0x7100) {
 
@@ -1436,7 +1475,7 @@ static void sigill_handler(int sig, int code, struct sigcontext *scp)
 		a7 -= 4;
 		WriteMacInt32(a7, (uint32)pc);
 		a7 -= 2;
-		WriteMacInt16(a7, scp->sc_ps);
+		WriteMacInt16(a7, sc_ps);
 		for (int i=7; i>=0; i--) {
 			a7 -= 4;
 			WriteMacInt32(a7, regs->a[i]);
@@ -1445,17 +1484,17 @@ static void sigill_handler(int sig, int code, struct sigcontext *scp)
 			a7 -= 4;
 			WriteMacInt32(a7, regs->d[i]);
 		}
-		scp->sc_sp = regs->a[7] = a7;
+		sc_sp = regs->a[7] = a7;
 
 		// Jump to EmulOp trampoline code on return
-		scp->sc_pc = (uint32)EmulOpTrampoline;
+		sc_pc = (uint32)EmulOpTrampoline;
 		
 	} else switch (opcode) {	// Emulate privileged instructions
 
 		case 0x40e7:	// move sr,-(sp)
 			regs->a[7] -= 2;
 			WriteMacInt16(regs->a[7], GET_SR);
-			scp->sc_sp = regs->a[7];
+			sc_sp = regs->a[7];
 			INC_PC(2);
 			break;
 
@@ -1463,14 +1502,14 @@ static void sigill_handler(int sig, int code, struct sigcontext *scp)
 			uint16 sr = ReadMacInt16(regs->a[7]);
 			STORE_SR(sr);
 			regs->a[7] += 2;
-			scp->sc_sp = regs->a[7];
+			sc_sp = regs->a[7];
 			INC_PC(2);
 			break;
 		}
 
 		case 0x007c: {	// ori #xxxx,sr
 			uint16 sr = GET_SR | pc[1];
-			scp->sc_ps = sr & 0xff;		// oring bits into the sr can't enable interrupts, so we don't need to call STORE_SR
+			sc_ps = sr & 0xff;		// oring bits into the sr can't enable interrupts, so we don't need to call STORE_SR
 			EmulatedSR = sr & 0xe700;
 			INC_PC(4);
 			break;
@@ -1550,13 +1589,13 @@ static void sigill_handler(int sig, int code, struct sigcontext *scp)
 		case 0xf327:	// fsave -(sp)
 			regs->a[7] -= 4;
 			WriteMacInt32(regs->a[7], 0x41000000);	// Idle frame
-			scp->sc_sp = regs->a[7];
+			sc_sp = regs->a[7];
 			INC_PC(2);
 			break;
 
 		case 0xf35f:	// frestore (sp)+
 			regs->a[7] += 4;
-			scp->sc_sp = regs->a[7];
+			sc_sp = regs->a[7];
 			INC_PC(2);
 			break;
 
@@ -1564,16 +1603,16 @@ static void sigill_handler(int sig, int code, struct sigcontext *scp)
 			uint32 a7 = regs->a[7];
 			uint16 sr = ReadMacInt16(a7);
 			a7 += 2;
-			scp->sc_ps = sr & 0xff;
+			sc_ps = sr & 0xff;
 			EmulatedSR = sr & 0xe700;
-			scp->sc_pc = ReadMacInt32(a7);
+			sc_pc = ReadMacInt32(a7);
 			a7 += 4;
 			uint16 format = ReadMacInt16(a7) >> 12;
 			a7 += 2;
 			static const int frame_adj[16] = {
 				0, 0, 4, 4, 8, 0, 0, 52, 50, 12, 24, 84, 16, 0, 0, 0
 			};
-			scp->sc_sp = regs->a[7] = a7 + frame_adj[format];
+			sc_sp = regs->a[7] = a7 + frame_adj[format];
 			break;
 		}
 
@@ -1636,20 +1675,18 @@ static void sigill_handler(int sig, int code, struct sigcontext *scp)
 			break;
 
 		default:
-ill:		printf("SIGILL num %d, code %d\n", sig, code);
-			printf(" context %p:\n", scp);
-			printf("  onstack %08x\n", scp->sc_onstack);
-			printf("  sp %08x\n", scp->sc_sp);
-			printf("  fp %08x\n", scp->sc_fp);
-			printf("  pc %08x\n", scp->sc_pc);
+ill:		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
+			printf(" context %p:\n", (void *)ucp);
+			printf("  uc_flags %08x\n", (unsigned)ucp->uc_flags);
+			printf("  sp %08x\n", sc_sp);
+			printf("  fp %08x\n", gr[_REG_A6]);
+			printf("  pc %08x\n", sc_pc);
 			printf("   opcode %04x\n", opcode);
-			printf("  sr %08x\n", scp->sc_ps);
-			printf(" state %p:\n", state);
-			printf("  flags %d\n", state->ss_flags);
+			printf("  sr %08x\n", sc_ps);
+									for (int i=0; i<8; i++)
+				printf("  d%d %08x\n", i, gr[_REG_D0 + i]);
 			for (int i=0; i<8; i++)
-				printf("  d%d %08x\n", i, state->ss_frame.f_regs[i]);
-			for (int i=0; i<8; i++)
-				printf("  a%d %08x\n", i, state->ss_frame.f_regs[i+8]);
+				printf("  a%d %08x\n", i, gr[_REG_A0 + i]);
 
 			VideoQuitFullScreen();
 #ifdef ENABLE_MON

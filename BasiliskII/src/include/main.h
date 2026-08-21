@@ -78,8 +78,8 @@ enum {
 };
 
 extern uint32 InterruptFlags;									// Currently pending interrupts
-extern void SetInterruptFlag(uint32 flag);						// Set/clear interrupt flags
-extern void ClearInterruptFlag(uint32 flag);
+extern "C" void SetInterruptFlag(uint32 flag);						// Set/clear interrupt flags
+extern "C" void ClearInterruptFlag(uint32 flag);
 
 // vde switch variable
 extern char* vde_sock;

@@ -21,28 +21,28 @@
 		.file	"asm_support.s"
 		.text
 
-		.globl	_m68k_sync_icache
-		.globl	_Start680x0__Fv
-		.globl	_SetInterruptFlag__FUi
-		.globl	_ClearInterruptFlag__FUi
-		.globl	_Execute68k
-		.globl	_Execute68kTrap
-		.globl	_EmulOpTrampoline
+		.globl	m68k_sync_icache
+		.globl	Start680x0
+		.globl	SetInterruptFlag
+		.globl	ClearInterruptFlag
+		.globl	Execute68k
+		.globl	Execute68kTrap
+		.globl	EmulOpTrampoline
 
-		.globl	_RAMBaseHost
-		.globl	_ROMBaseHost
-		.globl	_EmulOp__FUsP13M68kRegisters
-		.globl	_EmulatedSR
-		.globl	_InterruptFlags
-		.globl	_TriggerInterrupt__Fv
+		.globl	RAMBaseHost
+		.globl	ROMBaseHost
+		.globl	EmulOp
+		.globl	EmulatedSR
+		.globl	InterruptFlags
+		.globl	TriggerInterrupt
 
 
 /*
  *  Call m68k_sync_icache() (NetBSD, the version in libm68k is broken)
  */
 
-		.type	_m68k_sync_icache,@function
-_m68k_sync_icache:
+		.type	m68k_sync_icache,@function
+m68k_sync_icache:
 		movl	sp@(8),d1
 		movl	sp@(4),a1
 		movl	#0x80000004,d0
@@ -54,12 +54,12 @@ _m68k_sync_icache:
  *  Jump to Mac ROM, start emulation
  */
 
-		.type	_Start680x0__Fv,@function
-_Start680x0__Fv:
-		movl	_RAMBaseHost,a0
+		.type	Start680x0,@function
+Start680x0:
+		movl	RAMBaseHost,a0
 		addl	#0x8000,a0
 		movl	a0,sp
-		movl	_ROMBaseHost,a0
+		movl	ROMBaseHost,a0
 		lea	a0@(0x2a),a0
 		jmp	a0@
 
@@ -68,17 +68,17 @@ _Start680x0__Fv:
  *  Set/clear interrupt flag (atomically)
  */
 
-		.type	_SetInterruptFlag__FUi,@function
-_SetInterruptFlag__FUi:
+		.type	SetInterruptFlag,@function
+SetInterruptFlag:
 		movl	sp@(4),d0
-		orl	d0,_InterruptFlags
+		orl	d0,InterruptFlags
 		rts
 
-		.type	_ClearInterruptFlag__FUi,@function
-_ClearInterruptFlag__FUi:
+		.type	ClearInterruptFlag,@function
+ClearInterruptFlag:
 		movl	sp@(4),d0
 		notl	d0
-		andl	d0,_InterruptFlags
+		andl	d0,InterruptFlags
 		rts
 
 
@@ -88,8 +88,8 @@ _ClearInterruptFlag__FUi:
  */
 
 /* void Execute68k(uint32 addr, M68kRegisters *r); */
-		.type	_Execute68k,@function
-_Execute68k:	movl	sp@(4),d0		|Get arguments
+		.type	Execute68k,@function
+Execute68k:	movl	sp@(4),d0		|Get arguments
 		movl	sp@(8),a0
 
 		movml	d2-d7/a2-a6,sp@-	|Save registers
@@ -117,8 +117,8 @@ exec68kret:	movl	a6,sp@-			|Save a6
  */
 
 /* void Execute68kTrap(uint16 trap, M68kRegisters *r); */
-		.type	_Execute68kTrap,@function
-_Execute68kTrap:
+		.type	Execute68kTrap,@function
+Execute68kTrap:
 		movl	sp@(4),d0		|Get arguments
 		movl	sp@(8),a0
 
@@ -150,30 +150,30 @@ exectrapret:	movl	a6,sp@-			|Save a6
  *  Call EmulOp() after return from SIGILL handler, registers are pushed on stack
  */
 
-		.type	_EmulOpTrampoline,@function
-_EmulOpTrampoline:
+		.type	EmulOpTrampoline,@function
+EmulOpTrampoline:
 		movl	sp,a0			|Get pointer to registers
 
-		movw	_EmulatedSR,d0		|Save EmulatedSR, disable interrupts
+		movw	EmulatedSR,d0		|Save EmulatedSR, disable interrupts
 		movw	d0,sp@-
 		oriw	#0x0700,d0
-		movw	d0,_EmulatedSR
+		movw	d0,EmulatedSR
 
 		movl	a0,sp@-			|Push pointer to registers
 		movl	a0@(66),a1		|Get saved PC
 		addql	#2,a0@(66)		|Skip EMUL_OP opcode
 		movw	a1@,sp@-		|Push opcode word
 		clrw	sp@-
-		jbsr	_EmulOp__FUsP13M68kRegisters
+		jbsr	EmulOp
 		addql	#8,sp
 
 		movw	sp@+,d0			|Restore interrupts, trigger pending interrupt
-		movw	d0,_EmulatedSR
+		movw	d0,EmulatedSR
 		andiw	#0x0700,d0
 		bne	eot1
-		tstl	_InterruptFlags
+		tstl	InterruptFlags
 		beq	eot1
-		jbsr	_TriggerInterrupt__Fv
+		jbsr	TriggerInterrupt
 
 eot1:		moveml	sp@+,d0-d7/a0-a6	|Restore registers
 		addql	#4,sp			|Skip saved SP

@@ -1008,7 +1008,9 @@ void driver_window::mouse_moved(int x, int y)
 }
 
 
-#if defined(ENABLE_XF86_DGA) || defined(ENABLE_FBDEV_DGA)
+// driver_dga and its shared machinery are the common base for every
+// direct-framebuffer backend, so this guard has to name all of them.
+#if defined(ENABLE_XF86_DGA) || defined(ENABLE_FBDEV_DGA) || defined(ENABLE_WSCONS_DGA)
 /*
  *  DGA display driver base class
  */
@@ -1486,10 +1488,21 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 	the_buffer = ws_map + fbi.fbi_fboffset;
 	the_buffer_size = (uint32)fbi.fbi_fbsize;
 
-	// Tell the rest of the server what the hardware actually gives us,
-	// rather than assuming the trivial value: wscons reports its own
-	// stride and it need not equal width * bytes-per-pixel.
-	mode.bytes_per_row = fbi.fbi_stride;
+	// The mode's row stride is fixed by the caller and cannot be changed
+	// from here, so check it against the hardware instead of assuming.
+	// wscons reports its own stride and it need not be width times bytes
+	// per pixel -- this display is programmed for 1024 bytes per line at
+	// one point in its life and 640 at another.  A mismatch would shear
+	// every frame diagonally, which is a miserable thing to debug from
+	// the symptom, so refuse it here where the numbers are in hand.
+	if ((int)fbi.fbi_stride != mode.bytes_per_row) {
+		char str[256];
+		sprintf(str, "wscons stride is %u but the guest mode uses %d; "
+			"they must match\n", fbi.fbi_stride,
+			mode.bytes_per_row);
+		ErrorAlert(str);
+		return;
+	}
 
 	init_ok = true;
 }

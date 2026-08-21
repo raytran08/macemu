@@ -59,6 +59,14 @@ export STRIP="${HOST}-strip"
 export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 export PKG_CONFIG_LIBDIR="$SYSROOT/usr/X11R7/lib/pkgconfig:$SYSROOT/usr/lib/pkgconfig"
 export CPPFLAGS="-I$SYSROOT/usr/include -I$SYSROOT/usr/X11R7/include"
+
+# asm_support.s -- the native 68k trampolines, and the whole reason this
+# port is fast -- is written in MIT syntax with bare register names
+# ("movl sp@(8),a0").  Modern GNU as wants % prefixes and rejects every
+# line otherwise.  --register-prefix-optional accepts the old spelling; it
+# is passed through the compiler driver, which is what builds the .s file.
+export CFLAGS="-O2 -g -Wa,--register-prefix-optional"
+export CXXFLAGS="-O2 -g"
 export LDFLAGS="-L$SYSROOT/usr/lib -L$SYSROOT/usr/X11R7/lib -Wl,-rpath,/usr/X11R7/lib"
 
 # Autoconf cannot RUN its probes when cross compiling, so anything using
@@ -84,7 +92,31 @@ export LDFLAGS="-L$SYSROOT/usr/lib -L$SYSROOT/usr/X11R7/lib -Wl,-rpath,/usr/X11R
 # zero unless vm.user_va0_disable is cleared, and the two
 # signal-reinstall guesses, which cost only a redundant reinstall if the
 # guess is wrong.
-export BII_CROSS_HAVE_SIGCONTEXT_SUBTERFUGE=yes
+# Take the SIGINFO path, NOT the sigcontext subterfuge.
+#
+# Both exist in sigsegv.cpp and only one is compiled.  The subterfuge
+# branch carries a NetBSD/m68k case, but it was written when struct
+# sigcontext was public API; NetBSD now guards it
+#
+#     /usr/include/m68k/signal.h:
+#     #if defined(_LIBC) || defined(_KERNEL)
+#     struct sigcontext {
+#
+# so it is invisible to ordinary programs and the block fails to compile
+# on an incomplete type -- along with a reference to a "code" argument
+# that is not in that function's scope, which shows it has not been built
+# in a very long time.
+#
+# The SIGINFO path needs none of it: sigaction(SA_SIGINFO) hands the
+# handler a siginfo_t whose si_addr IS the fault address, so there is no
+# exception frame to decode and nothing platform-specific to write.  The
+# generic extended-signal block covers it, and NetBSD 10 supports this --
+# it is plain POSIX.
+#
+# The extended-signals probe is tried before the subterfuge one, so
+# answering it here settles the matter.
+export BII_CROSS_HAVE_EXTENDED_SIGNALS=yes
+export BII_CROSS_HAVE_SIGCONTEXT_SUBTERFUGE=no
 export BII_CROSS_SOCKLEN_T=yes
 export BII_CROSS_MMAP_ANON=yes
 export BII_CROSS_MPROTECT_WORKS=yes
