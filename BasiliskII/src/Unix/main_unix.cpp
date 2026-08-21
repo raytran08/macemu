@@ -1553,6 +1553,23 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 
 	// Jump to MacOS interrupt handler on return
 	sc_pc = ReadMacInt32(0x64);
+	/*
+	 * Every path through this handler converges here, so what __gregs
+	 * holds now is exactly what setcontext() will be asked to resume.
+	 * A context it refuses is not a signal: setcontext() returns EINVAL
+	 * inside libc's signal trampoline and libc exits with that errno,
+	 * with no message and no core.  That failure mode is invisible
+	 * enough to be worth two instructions per trap to catch.
+	 */
+	{
+		uint32 p = (uint32)sc_pc, t = (uint32)sc_ps;
+
+		if ((t & 0xffff7fe0u) != 0)   /* PSL_MBZ|PSL_IPL|PSL_S */
+			fprintf(stderr, "%s: SUSPECT CONTEXT pc=%08x ps=%08x "
+			    "a7=%08x\n", "sigirq", (unsigned)p, (unsigned)t,
+			    (unsigned)sc_sp);
+	}
+
 }
 
 
@@ -1584,17 +1601,6 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
 
-	/*
-	 * TEMPORARY.  The process dies with exit(22) from inside libc: the
-	 * signal trampoline resumes via setcontext(), which one time in
-	 * ~400000 is refused with EINVAL, and libc exits with the errno.
-	 * setcontext validates the context we have just rewritten, so
-	 * report anything it would object to -- an odd PC above all, since
-	 * RTE takes its return address off the guest stack.
-	 */
-	if ((sc_pc & 1) || (sc_ps & 0xe000))
-		fprintf(stderr, "BAD CONTEXT on entry: pc=%08x ps=%04x\n",
-		    (unsigned)sc_pc, (unsigned)sc_ps);
 
 	/* TEMPORARY: is the guest progressing, or going in circles? */
 	{
@@ -1623,10 +1629,27 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 
 #define INC_PC(n) sc_pc += (n)
 
+/*
+ * Bits of a 68k SR that may be placed in the *real* host SR.
+ *
+ * Only the condition codes, bits 0-4, are user state.  Bits 5-7 of the low
+ * byte are unused-must-be-zero, and NetBSD enforces that: cpu_mcontext_validate()
+ * in sys/arch/m68k/m68k/sig_machdep.c rejects any context whose PS has a bit
+ * in PSL_MBZ|PSL_IPL|PSL_S (0xffff7fe0, whose low byte is 0xe0).
+ *
+ * This matters because a rejected context is not a signal -- setcontext()
+ * returns EINVAL inside libc's signal trampoline and libc exits with that
+ * errno.  Masking with 0xff instead of 0x1f let a guest SR carrying any of
+ * bits 5-7 through to the kernel, which killed the emulator with a silent
+ * exit(22) after several hundred thousand traps.  The supervisor, trace and
+ * interrupt bits are unaffected: they are kept in software in EmulatedSR.
+ */
+#define SR_HOST_MASK 0x1f
+
 #define GET_SR (sc_ps | EmulatedSR)
 
 #define STORE_SR(v) \
-	sc_ps = (v) & 0xff; \
+	sc_ps = (v) & SR_HOST_MASK; \
 	EmulatedSR = (v) & 0xe700; \
 	if (((v) & 0x0700) == 0 && InterruptFlags) \
 		TriggerInterrupt();
@@ -1689,7 +1712,7 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 
 		case 0x007c: {	// ori #xxxx,sr
 			uint16 sr = GET_SR | pc[1];
-			sc_ps = sr & 0xff;		// oring bits into the sr can't enable interrupts, so we don't need to call STORE_SR
+			sc_ps = sr & SR_HOST_MASK;	// oring bits into the sr can't enable interrupts, so we don't need to call STORE_SR
 			EmulatedSR = sr & 0xe700;
 			INC_PC(4);
 			break;
@@ -1783,7 +1806,7 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 			uint32 a7 = regs->a[7];
 			uint16 sr = ReadMacInt16(a7);
 			a7 += 2;
-			sc_ps = sr & 0xff;
+			sc_ps = sr & SR_HOST_MASK;
 			EmulatedSR = sr & 0xe700;
 			sc_pc = ReadMacInt32(a7);
 			a7 += 4;
@@ -1855,11 +1878,6 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 			break;
 
 		default:
-	/* TEMPORARY: what we are about to hand setcontext */
-	if ((sc_pc & 1) || (sc_ps & 0xe000))
-		fprintf(stderr, "BAD CONTEXT on exit: pc=%08x ps=%04x "
-		    "op=%04x\n", (unsigned)sc_pc, (unsigned)sc_ps,
-		    (unsigned)opcode);
 
 ill:		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
 			printf(" context %p:\n", (void *)ucp);
@@ -1882,6 +1900,23 @@ ill:		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
 			QuitEmulator();
 			break;
 	}
+	/*
+	 * Every path through this handler converges here, so what __gregs
+	 * holds now is exactly what setcontext() will be asked to resume.
+	 * A context it refuses is not a signal: setcontext() returns EINVAL
+	 * inside libc's signal trampoline and libc exits with that errno,
+	 * with no message and no core.  That failure mode is invisible
+	 * enough to be worth two instructions per trap to catch.
+	 */
+	{
+		uint32 p = (uint32)sc_pc, t = (uint32)sc_ps;
+
+		if ((t & 0xffff7fe0u) != 0)   /* PSL_MBZ|PSL_IPL|PSL_S */
+			fprintf(stderr, "%s: SUSPECT CONTEXT pc=%08x ps=%08x "
+			    "a7=%08x\n", "sigill", (unsigned)p, (unsigned)t,
+			    (unsigned)sc_sp);
+	}
+
 }
 #endif
 
