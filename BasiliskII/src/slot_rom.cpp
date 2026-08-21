@@ -451,6 +451,18 @@ bool InstallSlotROM(void)
 
 	// Calculate checksum
 	ChecksumSlotROM();
+
+	{	/* TEMPORARY: did the slot ROM land where MacOS will look? */
+		uint8 *base = ROMBaseHost + ROMSize - slot_rom_size;
+		fprintf(stderr, "slotrom: size=%d placed at ROM+%u "
+		    "(host %p, mac %08x)\n", slot_rom_size,
+		    (unsigned)(ROMSize - slot_rom_size), (void *)base,
+		    (unsigned)(ROMBaseMac + ROMSize - slot_rom_size));
+		fprintf(stderr, "slotrom: first 16 bytes:");
+		for (int i = 0; i < 16; i++)
+			fprintf(stderr, " %02x", base[i]);
+		fprintf(stderr, "\n");
+	}
 	return true;
 }
 
