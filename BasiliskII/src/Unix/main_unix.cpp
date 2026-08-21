@@ -1536,6 +1536,25 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
 
+	/*
+	 * TEMPORARY.  This handler is the whole of native 68k mode: every
+	 * privileged instruction and every A-trap the guest executes lands
+	 * here.  Its machine-context access was rewritten for ucontext, so
+	 * if the guest is going astray this is the first place to look --
+	 * and whether it is called at all is itself the answer.
+	 */
+	{
+		static int ill_count;
+
+		if (ill_count < 24) {
+			fprintf(stderr, "sigill[%d]: pc=%08x op=%04x sr=%04x "
+			    "a7=%08x\n", ill_count, (unsigned)sc_pc,
+			    (unsigned)opcode, (unsigned)sc_ps,
+			    (unsigned)sc_sp);
+			ill_count++;
+		}
+	}
+
 #define INC_PC(n) sc_pc += (n)
 
 #define GET_SR (sc_ps | EmulatedSR)

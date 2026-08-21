@@ -274,6 +274,44 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
+## Status: guest executes; EMUL_OP dispatch loops
+
+Native 68k execution works.  The guest runs Mac ROM code on the 68040 and
+its traps reach `sigill_handler`, which is the whole of the mechanism --
+every privileged instruction and every EMUL_OP escape lands there.
+
+Instrumenting that handler shows the failure exactly:
+
+    sigill[0]: pc=0080008c op=7103 sr=0000 a7=00008000   <- dispatched
+    sigill[1]: pc=008b35c6 op=7104 sr=0008 a7=00007e98
+    sigill[2]: pc=008b35c6 op=7104 sr=0008 a7=00007e98   <- identical
+    ... forever
+
+`0x71xx` are Basilisk II's EMUL_OP escapes: illegal MOVEQ encodings
+patched into the ROM so it traps out to native code.  One dispatched and
+the guest moved on; the next loops on the same PC and never advances.
+The eventual `SIGSEGV at 0xff00ff00 [IP=0xff00ff00]` is the aftermath.
+
+**`a7` is the tell.**  The EMUL_OP path pushes PC, SR and all sixteen
+registers onto the guest stack (~72 bytes) and then redirects `sc_pc` to
+`EmulOpTrampoline`, which does `addql #2,a0@(66)` -- offset 66 being the
+saved PC for that push order -- to step past the two-byte escape.  If any
+of that were happening, `a7` would move.  It does not budge across every
+repeat, so the register saves are not taking effect and the PC is never
+advanced.
+
+Prime suspect is this port's own rewrite of the handler's machine-context
+access from `struct sigcontext` to `ucontext`.  One consequence deserves
+scrutiny: `sc_sp` and `regs->a[7]` were separate storage before and are
+now the same location, so `sc_sp = regs->a[7] = a7` writes one place
+where it used to write two.  That is believed harmless but is unproven,
+and the loop is consistent with the guest's A7 not being updated.
+
+The next test is narrow: confirm whether writes to `uc_mcontext.__gregs`
+inside the handler are honoured on return at all -- the first trap
+suggests yes, the rest suggest no, and that contradiction is the thread
+to pull.
+
 ## Status: the guest executes; it faults early in ROM startup
 
 Startup now runs to completion and hands control to the 68040:
