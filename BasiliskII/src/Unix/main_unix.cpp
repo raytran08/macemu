@@ -718,8 +718,10 @@ int main(int argc, char **argv)
 	const bool can_map_all_memory = false;
 #endif
 
+	fprintf(stderr, "mtrace: RAMSize=%u can_map_all_memory=%d\n", (unsigned)RAMSize, (int)can_map_all_memory);
 	// Try to allocate all memory from 0x0000, if it is not known to crash
 	if (can_map_all_memory && (vm_acquire_mac_fixed(0, RAMSize + ROM_MAX_SIZE) == 0)) {
+		fprintf(stderr, "mtrace: mapped RAM+ROM from 0x0000\n");
 		D(bug("Could allocate RAM and ROM from 0x0000\n"));
 		memory_mapped_from_zero = true;
 	}
@@ -740,11 +742,13 @@ int main(int argc, char **argv)
 #endif
 #endif /* REAL_ADDRESSING */
 
+	fprintf(stderr, "mtrace: memory areas decided\n");
 	// Create areas for Mac RAM and ROM
 #if REAL_ADDRESSING
 	if (memory_mapped_from_zero) {
 		RAMBaseHost = (uint8 *)0;
 		ROMBaseHost = RAMBaseHost + RAMSize;
+		fprintf(stderr, "mtrace: bases set RAM=%p ROM=%p\n", (void*)RAMBaseHost, (void*)ROMBaseHost);
 	}
 	else
 #endif
@@ -766,7 +770,8 @@ int main(int argc, char **argv)
 		ErrorAlert(STR_NO_MEM_ERR);
 		QuitEmulator();
 	}
-	ScratchMem += SCRATCH_MEM_SIZE/2;	// ScratchMem points to middle of block
+	ScratchMem += SCRATCH_MEM_SIZE/2;
+	fprintf(stderr, "mtrace: ScratchMem=%p\n", (void*)ScratchMem);	// ScratchMem points to middle of block
 #endif
 
 #if DIRECT_ADDRESSING
@@ -782,7 +787,9 @@ int main(int argc, char **argv)
 
 #if SDL_PLATFORM_MACOS
 	extern void set_current_directory();
+	fprintf(stderr, "mtrace: about to set_current_directory\n");
 	set_current_directory();
+	fprintf(stderr, "mtrace: set_current_directory done\n");
 #endif
 
 	// Get rom file path from preferences
@@ -802,6 +809,7 @@ int main(int argc, char **argv)
 		QuitEmulator();
 	}
 	lseek(rom_fd, 0, SEEK_SET);
+	fprintf(stderr, "mtrace: reading ROM to %p size %u\n", (void *)ROMBaseHost, (unsigned)ROMSize);
 	if (read(rom_fd, ROMBaseHost, ROMSize) != (ssize_t)ROMSize) {
 		ErrorAlert(STR_ROM_FILE_READ_ERR);
 		close(rom_fd);
@@ -838,8 +846,10 @@ int main(int argc, char **argv)
 #endif
 
 	// Initialize everything
+	fprintf(stderr, "mtrace: ROM read ok; entering InitAll\n");
 	if (!InitAll(vmdir))
 		QuitEmulator();
+	fprintf(stderr, "mtrace: InitAll returned\n");
 	D(bug("Initialization complete\n"));
 
 	D(bug("Mac RAM starts at %p (%08x)\n", RAMBaseHost, RAMBaseMac));
@@ -873,6 +883,7 @@ int main(int argc, char **argv)
 
 	// Install SIGILL handler for emulating privileged instructions and
 	// executing A-Trap and EMUL_OP opcodes
+	fprintf(stderr, "mtrace: installing signal handlers\n");
 	sigemptyset(&sigill_sa.sa_mask);	// Block virtual 68k interrupts during SIGILL handling
 	sigaddset(&sigill_sa.sa_mask, SIG_IRQ);
 	sigaddset(&sigill_sa.sa_mask, SIGALRM);

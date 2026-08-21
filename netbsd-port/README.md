@@ -205,7 +205,32 @@ A `netbsd*:m68k` case using `-Wl,-Ttext-segment=0x10000000` moves the
 image clear; no script file is needed. Verified: the binary now loads at
 0x10000000 and `HAVE_LINKER_SCRIPT` is defined.
 
-**Now: SIGILL during startup, right after XOpenDisplay.**  The relocated
+**Now: SIGILL in startup, narrowed to one call.**  Traces bracket it
+exactly:
+
+    mtrace: mapped RAM+ROM from 0x0000
+    mtrace: memory areas decided
+    mtrace: bases set RAM=0x0 ROM=0x800000
+    <dies -- the ScratchMem trace never prints>
+
+So it dies in `vm_acquire_mac(SCRATCH_MEM_SIZE)`, the next call after the
+bases are set.
+
+A mechanism worth checking first, because it explains why this appears
+only now: with RAM mapped from zero, `RAMBaseHost` is literally
+`(uint8 *)0`, so address 0 is valid, mapped, and full of zeros.  Any null
+or uninitialised function pointer that would previously have died with a
+clean SIGSEGV now *jumps into guest RAM* and executes zeros until it
+reaches something illegal.  An early, otherwise-inexplicable SIGILL is
+what that looks like.  UNTESTED.
+
+`ScratchMem` was suspected first, on the grounds that the
+`memory_mapped_from_zero` branch does not assign it while the `else`
+branch does -- but that is wrong: line 767 assigns it unconditionally for
+both paths, after the branch.
+
+**Old note kept, since the reasoning still holds:**
+SIGILL during startup, right after XOpenDisplay.  The relocated
 binary itself is sound -- `--help` runs and exits 0 -- so the image is not
 corrupt.  What changed is behaviour: with `HAVE_LINKER_SCRIPT` defined,
 `can_map_all_memory` is true and startup takes the
