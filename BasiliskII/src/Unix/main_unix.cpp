@@ -456,6 +456,17 @@ static void gui_activate (GtkApplication *app)
 
 
 
+
+/* TEMPORARY */
+static void report_fatal_signal(int sig)
+{
+	char buf[64];
+	int n = snprintf(buf, sizeof buf, "FATAL SIGNAL %d\n", sig);
+
+	(void)write(2, buf, n);
+	_exit(128 + sig);
+}
+
 int main(int argc, char **argv)
 {
 #ifdef ENABLE_GTK3
@@ -963,6 +974,21 @@ int main(int argc, char **argv)
 
 #ifdef ENABLE_MON
 	// Setup SIGINT handler to enter mon
+	/* TEMPORARY: report a fatal signal instead of vanishing */
+	{
+		struct sigaction q;
+
+		memset(&q, 0, sizeof(q));
+		sigemptyset(&q.sa_mask);
+		q.sa_handler = report_fatal_signal;
+		q.sa_flags = 0;
+		sigaction(SIGTERM, &q, NULL);
+		sigaction(SIGHUP, &q, NULL);
+		sigaction(SIGQUIT, &q, NULL);
+		sigaction(SIGABRT, &q, NULL);
+		sigaction(SIGPIPE, &q, NULL);
+	}
+
 	sigemptyset(&sigint_sa.sa_mask);
 	sigint_sa.sa_handler = (void (*)(int))sigint_handler;
 	sigint_sa.sa_flags = 0;
@@ -1057,6 +1083,7 @@ int main(int argc, char **argv)
 
 void QuitEmulator(void)
 {
+	fprintf(stderr, "QuitEmulator called\n");
 	D(bug("QuitEmulator\n"));
 
 #if EMULATED_68K

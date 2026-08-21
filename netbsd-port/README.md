@@ -295,7 +295,22 @@ roughly 700 traps/sec, so about 1.4ms for what hardware does in
 microseconds.  Nothing is wrong; there is simply a very large constant
 factor.
 
-**Open: it exits silently.**  No fault, no message, exit after roughly
+**Open: it exits with status 22, and it is real.**  Confirmed not to be
+an artefact of how it is launched: a run started with `nohup`, fully
+detached, with no watchdog and nothing holding it, ended by itself at
+396,000 traps.  Three runs now: 396k, 406k, 416k.
+
+Status 22 is a deliberate `exit(22)`, not a signal -- a killed process
+would report 128+signal.  It bypasses `QuitEmulator` (instrumented, never
+prints) and a handler installed for SIGTERM/HUP/QUIT/ABRT/PIPE (never
+fires).  No literal `exit(22)` appears in the source.  The log's final
+line is an ordinary trap sample; nothing is printed on the way out.
+
+The last EMUL_OP seen repeatedly before the end is 0x7130 at pc
+0x0009d576 -- `M68K_EMUL_OP_BLOCK_MOVE`, which is common enough during
+boot that its presence proves nothing on its own.
+
+Earlier note, now superseded:  No fault, no message, exit after roughly
 400,000 traps -- 406000 in one run, 416000 in another, suspiciously
 close.  Memory is tight (about 6.7MB free, 31MB active on a 68MB
 machine).  Whether that is a resource limit, a guest-side shutdown, or
