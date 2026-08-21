@@ -295,7 +295,32 @@ roughly 700 traps/sec, so about 1.4ms for what hardware does in
 microseconds.  Nothing is wrong; there is simply a very large constant
 factor.
 
-**Open: it exits with status 22, and it is real.**  Confirmed not to be
+**The exit(22) is setcontext() failing.**  ktrace, attached near the end
+and dumped, catches it exactly:
+
+    setcontext(0xc941140)  RET  JUSTRETURN          <- thousands of times
+    setcontext(0xc941140)  RET  -1 errno 22 Invalid argument
+    exit(0x16)                                      <- 0x16 == 22
+
+NetBSD's signal trampoline returns from a handler by calling
+`setcontext()`.  It succeeds for hundreds of thousands of traps, then one
+call is refused with EINVAL and libc exits with that errno.  That is why
+nothing is printed and why `QuitEmulator` is never reached: the exit
+happens inside libc, below the emulator.
+
+`setcontext` validates the context it is handed, and our handlers rewrite
+`__gregs` -- PC, PS and A7 -- on every trap.  So one of those writes
+eventually produces something the kernel will not resume.  RTE is the
+obvious suspect, since it takes its return address off the guest stack
+(`sc_pc = ReadMacInt32(a7)`).
+
+A first attempt to catch it (rejecting an odd PC or a PS with high bits
+set) never fired, but that check was placed only before the `ill:` label
+-- the unhandled-opcode path -- so it never ran on the branches that
+actually return, and `sigirq_handler` was not instrumented at all.  The
+check needs to be on every return path, in both handlers.
+
+Earlier framing, still accurate as far as it goes:  Confirmed not to be
 an artefact of how it is launched: a run started with `nohup`, fully
 detached, with no watchdog and nothing holding it, ended by itself at
 396,000 traps.  Three runs now: 396k, 406k, 416k.

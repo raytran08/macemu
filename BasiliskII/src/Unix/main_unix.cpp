@@ -1584,6 +1584,18 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
 
+	/*
+	 * TEMPORARY.  The process dies with exit(22) from inside libc: the
+	 * signal trampoline resumes via setcontext(), which one time in
+	 * ~400000 is refused with EINVAL, and libc exits with the errno.
+	 * setcontext validates the context we have just rewritten, so
+	 * report anything it would object to -- an odd PC above all, since
+	 * RTE takes its return address off the guest stack.
+	 */
+	if ((sc_pc & 1) || (sc_ps & 0xe000))
+		fprintf(stderr, "BAD CONTEXT on entry: pc=%08x ps=%04x\n",
+		    (unsigned)sc_pc, (unsigned)sc_ps);
+
 	/* TEMPORARY: is the guest progressing, or going in circles? */
 	{
 		static unsigned long n;
@@ -1843,6 +1855,12 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 			break;
 
 		default:
+	/* TEMPORARY: what we are about to hand setcontext */
+	if ((sc_pc & 1) || (sc_ps & 0xe000))
+		fprintf(stderr, "BAD CONTEXT on exit: pc=%08x ps=%04x "
+		    "op=%04x\n", (unsigned)sc_pc, (unsigned)sc_ps,
+		    (unsigned)opcode);
+
 ill:		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
 			printf(" context %p:\n", (void *)ucp);
 			printf("  uc_flags %08x\n", (unsigned)ucp->uc_flags);
