@@ -274,6 +274,56 @@ i.e. where the guest's RAM is expected to be in real-addressing mode.
 feeds `PAGEZERO_HACK`, the Mach-O `__PAGEZERO` trick, and does nothing on
 NetBSD.
 
+## Status: Mac OS boots to the desktop, then exits silently
+
+It was never stalled at the welcome screen -- it is **slow**, and every
+observation that said otherwise was made by killing it too early.  Two
+framebuffer captures, three minutes apart, taken with `fbshot`:
+
+- `doc-startup-screen.png` -- the Mac OS splash with the happy Mac, and
+  "Starting up..." with the progress bar about 15% along
+- `doc-desktop.png` -- splash gone, desktop pattern filling the screen,
+  menu bar drawn across the top
+
+So it loads extensions and reaches the Finder.
+
+**Why it is slow** is structural: in native 68k mode every A-line trap and
+every privileged instruction becomes a Unix signal -- SIGILL, kernel
+delivery, our handler builds a Mac exception frame, return, ROM
+dispatcher.  That is the entire toolbox going through signal delivery, at
+roughly 700 traps/sec, so about 1.4ms for what hardware does in
+microseconds.  Nothing is wrong; there is simply a very large constant
+factor.
+
+**Open: it exits silently.**  No fault, no message, exit after roughly
+400,000 traps -- 406000 in one run, 416000 in another, suspiciously
+close.  Memory is tight (about 6.7MB free, 31MB active on a 68MB
+machine).  Whether that is a resource limit, a guest-side shutdown, or
+something reached at a particular point in the boot is unknown.
+
+### fbshot: seeing the screen without a human
+
+`fbshot.c` captures the framebuffer to a PPM, expanding 8-bit indices
+through the hardware CLUT read with WSDISPLAYIO_GETCMAP.  It is read-only
+and never changes the display mode, so it is safe to run while a DGA
+guest owns the display.
+
+Retrieve with:
+
+    ./fbshot screen.ppm && gzip -9 screen.ppm
+    # then, from the build host, over rexec:
+    od -An -v -tx1 screen.ppm.gz | tr -d ' \n'
+
+and unhex/gunzip at the other end.  Every question about this port until
+now needed someone at the screen; this answers them directly.
+
+### Testing note
+
+Kill runs with SIGINT, never SIGKILL.  The driver restores the palette,
+the display mode and the kernel cursor in its destructor, and `pkill -9`
+skips all of it -- which is why an X session was left black and white
+after one run.
+
 ## Status: reaches "Welcome to Macintosh", does not get past it
 
 Correction to an earlier claim here: this is NOT a completed boot.  Mac OS

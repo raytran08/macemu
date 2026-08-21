@@ -6,3 +6,6 @@ BasiliskII
 wedgebisect
 mapnotifytest
 cmaptest
+fbshot
+screen.ppm*
+s[0-9].ppm*

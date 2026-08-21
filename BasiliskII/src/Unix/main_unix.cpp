@@ -1557,6 +1557,29 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
 
+	/* TEMPORARY: is the guest progressing, or going in circles? */
+	{
+		static unsigned long n;
+		static uint32 seen[8];
+		static int nseen;
+
+		if ((++n % 2000) == 0) {
+			int i, fresh = 0;
+
+			for (i = 0; i < nseen; i++)
+				if (seen[i] == (uint32)sc_pc)
+					break;
+			if (i == nseen) {
+				fresh = 1;
+				if (nseen < 8)
+					seen[nseen++] = (uint32)sc_pc;
+			}
+			fprintf(stderr, "trap %lu: pc=%08x op=%04x%s\n",
+			    n, (unsigned)sc_pc, (unsigned)opcode,
+			    fresh ? " (new pc)" : "");
+		}
+	}
+
 
 
 #define INC_PC(n) sc_pc += (n)
