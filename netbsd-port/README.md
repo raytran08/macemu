@@ -216,8 +216,27 @@ exactly:
 So it dies in `vm_acquire_mac(SCRATCH_MEM_SIZE)`, the next call after the
 bases are set.
 
-A mechanism worth checking first, because it explains why this appears
-only now: with RAM mapped from zero, `RAMBaseHost` is literally
+**The null-pointer hypothesis is NOT confirmed.**  An early SIGILL
+handler was installed to print the faulting PC -- low PC would mean
+executing guest memory, a PC near 0x10000000 would mean a real bad
+instruction in our own text.  It never printed: the process died with the
+default action despite the handler being installed, which usually means
+signal delivery failed for want of a usable stack.
+
+Retried with `sigaltstack` + `SA_ONSTACK`, and handlers for SIGBUS and
+SIGSEGV as well.  The result was not a captured PC but a *changed failure
+mode*: no SIGILL, no core, the process simply blocks at the same point
+until killed.  Still no handler output, so no signal is being delivered
+at all now.
+
+That the failure changes when fault handlers are merely installed is
+itself a clue, and not one that fits the null-jump story cleanly.  A
+wild jump should still trap.  Something about signal disposition or
+delivery is involved.  Next: find out whether it is blocked in
+vm_acquire_mac itself -- ktrace will say, as it did for the X socket --
+rather than inferring from the outside again.
+
+The original mechanism, still unproven, was: with RAM mapped from zero, `RAMBaseHost` is literally
 `(uint8 *)0`, so address 0 is valid, mapped, and full of zeros.  Any null
 or uninitialised function pointer that would previously have died with a
 clean SIGSEGV now *jumps into guest RAM* and executes zeros until it

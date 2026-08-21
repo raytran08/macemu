@@ -454,6 +454,74 @@ static void gui_activate (GtkApplication *app)
 #endif
 #endif
 
+
+/*
+ * TEMPORARY -- test of the null-pointer hypothesis.
+ *
+ * With RAM mapped from zero, address 0 is valid, mapped and full of
+ * zeros, so a call through a null or uninitialised function pointer no
+ * longer dies with a clean SIGSEGV: it jumps into guest RAM and executes
+ * zeros until it meets something illegal.  That would produce exactly the
+ * early, unexplained SIGILL seen here.
+ *
+ * The PC settles it.  Executing guest memory means a low PC (RAM is
+ * 0x0 to 0x800000, ROM above that).  A genuine bad instruction in our own
+ * code means a PC up at 0x10000000, where the image is now linked.
+ */
+static void early_sigill(int sig, siginfo_t *sip, void *uap)
+{
+	ucontext_t *ucp = (ucontext_t *)uap;
+	__greg_t *gr = ucp->uc_mcontext.__gregs;
+
+	fprintf(stderr, "EARLY FAULT sig=%d: pc=%08x sr=%04x fault=%p\n", sig,
+	    (unsigned)gr[_REG_PC], (unsigned)gr[_REG_PS],
+	    sip ? sip->si_addr : NULL);
+	fprintf(stderr, "  a7=%08x a6=%08x d0=%08x\n",
+	    (unsigned)gr[_REG_A7], (unsigned)gr[_REG_A6],
+	    (unsigned)gr[_REG_D0]);
+	fprintf(stderr, "  %s\n", (unsigned)gr[_REG_PC] < 0x01000000u ?
+	    "PC IS LOW -> executing guest memory (null-pointer jump)" :
+	    "PC is in our own text -> a real illegal instruction");
+	_exit(9);
+}
+
+static void install_early_sigill(void)
+{
+	struct sigaction sa;
+
+	static char altstack[SIGSTKSZ * 4];
+	stack_t ss;
+
+	/*
+	 * On its own stack, and that matters here.  The first attempt at
+	 * this handler never ran: the process died with the default action
+	 * even though the handler was installed.  Signal delivery has to
+	 * push a frame onto the user stack, so a wild stack pointer means
+	 * the kernel cannot deliver and kills the process instead -- and a
+	 * wild a7 is exactly what jumping into garbage produces.  An
+	 * alternate stack sidesteps that.
+	 */
+	memset(&ss, 0, sizeof(ss));
+	ss.ss_sp = altstack;
+	ss.ss_size = sizeof(altstack);
+	ss.ss_flags = 0;
+	if (sigaltstack(&ss, NULL) < 0)
+		fprintf(stderr, "mtrace: sigaltstack failed: %s\n",
+		    strerror(errno));
+
+	memset(&sa, 0, sizeof(sa));
+	sigemptyset(&sa.sa_mask);
+	sa.sa_sigaction = early_sigill;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+	if (sigaction(SIGILL, &sa, NULL) < 0)
+		fprintf(stderr, "mtrace: sigaction(SIGILL) failed: %s\n",
+		    strerror(errno));
+	/* SIGBUS and SIGSEGV too: a wild jump may trip either first */
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGSEGV, &sa, NULL);
+	fprintf(stderr, "mtrace: early fault handlers installed (altstack)\n");
+}
+
 int main(int argc, char **argv)
 {
 #ifdef ENABLE_GTK3
@@ -604,6 +672,7 @@ int main(int argc, char **argv)
 	 * of one stops answering every client -- which is the failure seen
 	 * on this port.
 	 */
+	install_early_sigill();
 	fprintf(stderr, "mtrace: about to XInitThreads/XOpenDisplay\n");
 	if (!XInitThreads())
 		fprintf(stderr, "warning: XInitThreads() failed\n");
