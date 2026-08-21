@@ -172,6 +172,49 @@ on the target — `sigsegv_recovery` in particular, if VOSF is ever wanted.
 XFree86-DGA extension, which kdrive/tinyx does not. `ENABLE_FBDEV_DGA`
 needs no X extension, only the device — which is why it is the viable one.
 
+## The X server wedge (open)
+
+Running the emulator wedges Xwscons: it stops answering every client,
+xdpyinfo included.  The emulator's own symptom is a hang in
+`wait_mapped()`, blocked in `poll()` on the X socket forever.
+
+**Two diagnoses were published here and both were wrong.**  First, that
+kdrive never delivers `MapNotify` to an override-redirect window --
+`wait_mapped()` waits on exactly that, and `ktrace` showed the blocked
+poll.  Second, that `driver_wscons` issuing `WSDISPLAYIO_SMODE` under a
+live server was disturbing it.  The driver now asks `GMODE` first and
+leaves an already-mapped display alone, which is correct regardless, and
+X still wedged.
+
+`wedgebisect.c` settles what does NOT cause it.  Against a live server,
+each step added one at a time, every stage completes and X keeps
+answering:
+
+1. create a fullscreen override-redirect window
+2. map it -- **`MapNotify` ARRIVES**, disproving the first diagnosis
+3. set input focus
+4. grab the keyboard
+5. grab the pointer
+6. `XChangePointerControl` (what `disable_mouse_accel` does)
+7. mmap the framebuffer and write to it
+
+So the wedge is in something the driver does that this does not.  What
+remains untested: the `CWColormap` window attribute (the bisect uses the
+default visual and no colormap), `set_window_name`, and -- most
+interesting -- the emulator's threads and its 60 Hz signal traffic, since
+Xlib is not thread-safe without `XInitThreads` and the native 68k build
+takes `SIGALRM` and `SIG_IRQ` constantly.
+
+The next step is to instrument the real driver rather than build more
+synthetic stages: print through the constructor and see how far it gets
+before the server stops answering.
+
+Note the first version of the bisect produced a meaningless "all stages
+passed": it called `XSetInputFocus` on an unmapped window, which is
+`BadMatch`, and Xlib's default error handler exits -- so stages 2 to 6
+never ran their steps.  Mapping now precedes focus and the handler is
+non-fatal.
+
 ## Build status
 
 `driver_wscons` is written and `configure` selects it. The build gets

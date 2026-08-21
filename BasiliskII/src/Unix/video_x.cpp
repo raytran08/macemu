@@ -1426,15 +1426,41 @@ driver_wscons::driver_wscons(X11_monitor_desc &m) : driver_dga(m),
 		return;
 	}
 
-	// Ask for mapped mode.  Under X this is already set and the request
-	// is redundant -- the mapping is inherited -- so a failure here is
-	// not fatal; it is only needed when running without a server.
-	wsmode = WSDISPLAYIO_MODE_DUMBFB;
-	if (ioctl(ws_fd, WSDISPLAYIO_SMODE, &wsmode) == 0)
-		ws_mode_set = true;
-	else
-		D(bug("wscons: SMODE DUMBFB refused (%s); assuming X has "
-			"already set it\n", strerror(errno)));
+	/*
+	 * Ask what mode the display is in before touching it.
+	 *
+	 * If an X server is running it has already put the display into a
+	 * mapped mode, and the mapping below is simply inherited -- proven
+	 * with a standalone probe before this driver was written.  Changing
+	 * the mode underneath a live server is not merely redundant, it is
+	 * actively harmful: it goes through genfb and the console driver
+	 * while the server believes it owns the scanout, and a server so
+	 * disturbed stops answering its clients entirely.  That wedged a
+	 * session, and the emulator's own hang -- blocked in wait_mapped()
+	 * on a MapNotify -- was the symptom rather than the cause.
+	 *
+	 * So set the mode only from text mode, which is the standalone case
+	 * where it is genuinely needed, and record whether we did so the
+	 * destructor knows whether it has any business restoring it.
+	 */
+	wsmode = WSDISPLAYIO_MODE_EMUL;
+	if (ioctl(ws_fd, WSDISPLAYIO_GMODE, &wsmode) < 0) {
+		D(bug("wscons: GMODE failed (%s); leaving the mode alone\n",
+			strerror(errno)));
+	} else if (wsmode == WSDISPLAYIO_MODE_EMUL) {
+		wsmode = WSDISPLAYIO_MODE_DUMBFB;
+		if (ioctl(ws_fd, WSDISPLAYIO_SMODE, &wsmode) == 0)
+			ws_mode_set = true;
+		else {
+			char str[256];
+			sprintf(str, "Cannot enter mapped mode on %s: %s\n",
+				ws_path, strerror(errno));
+			ErrorAlert(str);
+			return;
+		}
+	} else
+		D(bug("wscons: display already mapped (mode %d); inheriting "
+			"it and leaving the mode untouched\n", wsmode));
 
 	// Save the palette we are about to displace.
 	{
