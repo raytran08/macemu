@@ -115,6 +115,31 @@ the X session behind it, and vice versa.
 This is a fullscreen-DGA design, so the emulator owning the palette
 whenever it has focus is defensible — but it needs testing, not assuming.
 
+**Tested with `cmapprobe.c`, and the mechanism works.** Against a live
+Xwscons on the target:
+
+- `WSDISPLAYIO_GETCMAP` returns a full 256-entry map — X's own allocated
+  colours, `[0] ff ff ff` (white) through `[255] 00 00 00` (black), with
+  allocations scattered between: magenta near 51, blue near 102, purple
+  near 153, orange near 204
+- `WSDISPLAYIO_PUTCMAP` is **accepted while X is running** and reaches
+  the hardware
+- restoring the saved map afterwards works exactly: a 256-entry index
+  ramp drawn into the framebuffer renders with its bands falling on the
+  colours `GETCMAP` had reported, which is only possible if the restore
+  was byte-for-byte
+- the X session survives all of it
+
+So `update_palette()` is implementable the straightforward way: save on
+entry, install the guest's map, restore on exit. There is one hardware
+colormap serving both parties — our pixels rendering through X's palette
+proves it — so the save/restore is mandatory rather than optional.
+
+Note `GETCMAP` is safe here where a direct RAMDAC readback is not: it
+returns genfb's software copy rather than reading the DAC data register,
+which on this hardware desynchronises the R/G/B phase and turns the
+display red.
+
 ## Build notes
 
 **SDL is not required, but it is the default** — and `configure.ac` lies
