@@ -538,14 +538,42 @@ That also explains the earlier confusion about entering the hook "32
 bytes in": the guest is not jumping into the middle of a routine, it is
 correctly returning from a different trap than the one being resumed.
 
-The question is now sharp and small: this resume path selects an A-line
-frame to return to, and in the fatal pass one extra frame (trap #2's) is
-interposed above the one it wants.  Either the resume path is reached
-with an extra nested A-line in flight, or trap #1's frame has been
-consumed early.  bfast's shadow stack can answer this directly -- log the
-full frame list, not just the depth and top, at the resume tail and at
-each a815 in this hook -- and that is a small change to an instrument
-that now works.
+Full frame-list logging, plus events on both a815 sites, gives the
+sequence in order.  One run to the crash:
+
+     0  40826f6a  sp=005fa192  depth=7   top: 00010f28 @ 005fa196
+                                          then 00010ea2 @ 005fa19e
+     1  40826f78  sp=005fa1b2  depth=5   (both pruned: sp rose past them)
+     2  408265f0  sp=005fa19c  depth=5
+     3  4082661e  sp=005fa19c  depth=5   pops 00010f2a -- CORRECT
+     4  00010f2a  sp=005fa1a4  depth=5   hook body runs
+     5  00010f48  sp=005fa196  depth=5   hook reaches its SECOND a815
+        ... crash
+
+So the resume works correctly here (event 3 pops trap #1's return, the
+hook resumes properly at 00010f2a and runs), and the failure follows
+immediately after the hook takes its second a815 -- selector 4,
+SCSIComplete.  The crash is in the return from THAT trap.
+
+Note the depth-7 moment at event 0: TWO A-line frames are live at
+005fa196 and 005fa19e, from 00010f28 and 00010ea2, eight bytes apart --
+nested a815s from this hook and its neighbour.  This region of the OS
+nests A-line traps routinely, so the resume path is picking among
+genuinely stacked frames, and an off-by-one-frame there is exactly the
+observed failure.
+
+Also confirmed again in the same run: selector 4 never reaches
+Basilisk's _SCSIDispatch replacement (15 calls, all selectors 1 and 2),
+even though the a815 at 00010f48 definitely traps and is definitely
+selector 4.  Something between the trap and the replacement is
+mis-dispatching, and given the crash lands in the return from that exact
+trap, those two facts are likely the same fact.
+
+NEXT: log the return path of the a815 at 00010f48 specifically -- where
+the dispatcher sends it, and what the stack looks like when it comes
+back.  The instrument is already in place; it needs the dispatcher's
+entry (008099b0) and the handler address it computes added to the event
+pc list.
 
 Superseded options, kept for the record:
 1. Emulate the faulting store inside the SIGSEGV handler (decode the

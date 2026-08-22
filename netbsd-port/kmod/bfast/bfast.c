@@ -90,7 +90,8 @@ static uint32_t	bf_tr_armed_ret;	/* pc that closes the window */
  * the SAME code path possible within one run.
  */
 #define BF_EVN		256
-struct bf_ev_ent { uint32_t pc, sp, fp, a0, aln, alpc; };
+struct bf_ev_ent { uint32_t pc, sp, fp, a0, aln, alpc;
+			  uint32_t f[4], fsp[4]; };
 
 /*
  * Shadow stack of live A-line frames.
@@ -779,7 +780,9 @@ bf_ctrap_trace(uint32_t *r)
 	 */
 	if (__predict_false(pc == 0x408265f0 || pc == 0x4082661e ||
 	    pc == 0x40826f78 || pc == 0x40826f6a ||
-	    pc == 0x408268ca)) {
+	    pc == 0x408268ca ||
+	    pc == 0x00010f28 || pc == 0x00010f48 ||
+	    pc == 0x00010f2a || pc == 0x00010f4a)) {
 		struct bf_ev_ent *v = &bf_ev[bf_ev_n & (BF_EVN - 1)];
 		uint32_t sp = bf_usp_read();
 
@@ -801,6 +804,17 @@ bf_ctrap_trace(uint32_t *r)
 		bf_al_prune(sp);
 		v->aln = (uint32_t)bf_al_n;
 		v->alpc = bf_al_n > 0 ? bf_al_pc[bf_al_n - 1] : 0;
+		{
+			int i;
+
+			/* top four live frames, newest first */
+			for (i = 0; i < 4; i++) {
+				int j = bf_al_n - 1 - i;
+
+				v->f[i]   = (j >= 0) ? bf_al_pc[j] : 0;
+				v->fsp[i] = (j >= 0) ? bf_al_sp[j] : 0;
+			}
+		}
 		bf_ev_n++;
 	}
 
@@ -1021,7 +1035,7 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "events",
-			    SYSCTL_DESCR("struct {u32 pc,sp,fp,a0,aln,alpc}[256]"),
+			    SYSCTL_DESCR("struct {u32 pc,sp,fp,a0,aln,alpc,f[4],fsp[4]}[256]"),
 			    NULL, 0, bf_ev, sizeof(bf_ev),
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
