@@ -52,6 +52,7 @@ static struct sysctllog *bf_clog;
  * Shared with the stubs (asm) -- non-static, bf_ prefixed.
  */
 struct pcb	*bf_pcb;		/* gate: registered lwp's pcb */
+static pid_t	bf_pid;			/* who registered; re-checked in C */
 uint32_t	bf_orig_priv;		/* stock vector 8 handler */
 uint32_t	bf_orig_aline;		/* stock vector 10 handler */
 uint32_t	bf_n_fast;		/* emulated at trap level */
@@ -224,6 +225,17 @@ int
 bf_ctrap_priv(uint32_t *r)
 {
 	struct bf_hwframe *f = BF_FRAME(r);
+
+	/*
+	 * The asm gate compares curpcb against a saved pointer, which is
+	 * fast but not an identity: if the emulator dies by SIGKILL while
+	 * attached (no detach runs) and the allocator later hands that pcb
+	 * to another process, its privilege violations would be given guest
+	 * semantics.  Confirm the pid here, where a compare is free next to
+	 * the work below.
+	 */
+	if (__predict_false(curproc->p_pid != bf_pid))
+		return 0;
 	uint32_t pc = bf_frame_pc(f);
 	uint32_t usp = bf_usp_read();
 	uint16_t op, ext, sr;
@@ -418,6 +430,9 @@ int
 bf_ctrap_aline(uint32_t *r)
 {
 	struct bf_hwframe *f = BF_FRAME(r);
+
+	if (__predict_false(curproc->p_pid != bf_pid))
+		return 0;
 	uint32_t pc = bf_frame_pc(f);
 	uint32_t usp = bf_usp_read();
 	uint32_t npc;
@@ -485,10 +500,12 @@ bf_sysctl_attach(SYSCTLFN_ARGS)
 		if (bf_pcb != NULL && bf_pcb != lwp_getpcb(curlwp))
 			return EBUSY;
 		bf_pcb = lwp_getpcb(curlwp);
+		bf_pid = curproc->p_pid;
 		printf("bfast: attached pid %d (emulsr %08x intflags %08x)\n",
 		    curproc->p_pid, bf_uaddr_emulsr, bf_uaddr_intflags);
 	} else {
 		bf_pcb = NULL;
+		bf_pid = 0;
 		printf("bfast: detached\n");
 	}
 	return 0;
@@ -594,6 +611,7 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			splx(s);
 		}
 		bf_pcb = NULL;
+		bf_pid = 0;
 		sysctl_teardown(&bf_clog);
 		if (bf_alloc != NULL) {
 			kmem_free(bf_alloc, bf_alloclen);

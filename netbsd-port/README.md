@@ -19,6 +19,37 @@ display is the entire cost. Everything below follows from that.
 
 
 
+
+### Correction: Applesex.hfv is NOT damaged; System 7.5 hits a real bug
+
+Commit 1a50cab7's message claims the System 7.5 volume is damaged.  That
+was wrong, and this note supersedes it.
+
+The reasoning was: both the fixed and the pre-fix binary died on that
+image at ~18000 traps with an identical `SIGSEGV at 0x9fc0000
+[IP=0x9fc0000]`, so the variable had to be the image rather than the
+build.  The first half of that is sound; the conclusion was not.  Two
+binaries failing identically is equally consistent with a deterministic
+emulator bug that this guest triggers, and that is what it turned out to
+be.  A pristine 200MB copy, transferred fresh, fails at the same address,
+as does the same copy with the bfast module unloaded.  Three variables
+eliminated -- build, disk contents, kernel fast path -- and the fault
+does not move.
+
+What is known about it: the faulting address is the instruction pointer
+itself (`IP == fault address`), so control transferred to 0x09fc0000 and
+faulted on the fetch.  That is a HOST address, well below MAP_BASE
+(0x10000000) and about 31MB past the text segment base (0x08000000), so
+it is not a guest address that failed to translate -- something jumped
+the host CPU through a bad pointer.  The same image demonstrably booted
+to the Finder earlier in its history, so this is a state-dependent path
+rather than an unconditional one.
+
+Consequence for the fast-path results: they were all measured on Disk
+Tools 7.1, which boots and runs indefinitely.  They stand on that
+workload.  The heavier System 7.5 workload remains unmeasured, and this
+bug -- not disk damage -- is what blocks it.
+
 ### Trap census: what an in-kernel fast path must cover
 
 Measured on the Disk Tools 7.1 desktop (histogram built into
