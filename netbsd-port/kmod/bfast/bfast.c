@@ -160,6 +160,19 @@ bf_sd_note(uint16_t op, int32_t delta)
 static uint32_t	bf_arm_now;		/* sysctl: arm at the next priv trap */
 static uint32_t	bf_watch_addr;		/* derived: what the fatal rts pops */
 static int	bf_tracing;		/* sticky: keep T1 across SR writes */
+
+/*
+ * Diagnostics master switch (kern.bfast.diag, default OFF).
+ *
+ * The watchpoint, the A-line shadow stack, the stack-delta audit, the SR
+ * balance tracker and the event log all ran unconditionally on every
+ * trap while the 0x9fc0000 fault was being hunted.  Together that is a
+ * linear search over up to 64 entries, a prune loop, several compares
+ * and a user fetch -- on a path taken 24,000 times a second.  They are
+ * kept, because they earned their place, but they are off unless asked
+ * for.
+ */
+static int	bf_diag;
 #define BF_MARK_ARM	0xfeedfaceu	/* ring marker: tracing armed here */
 
 /* Registered user addresses of Basilisk's virtual-SR state. */
@@ -400,18 +413,17 @@ bf_ctrap_priv(uint32_t *r)
 	uint16_t op, ext, sr;
 	int st;
 
-	bf_watch_check(pc);
-	bf_al_prune(bf_usp_read());
+	if (__predict_false(bf_diag)) {
+		bf_watch_check(pc);
+		bf_al_prune(bf_usp_read());
+	}
 
 	if (ufetch_16((const uint16_t *)pc, &op))
 		goto defer;
 
-	{
-		uint32_t sp_before = usp;
-		int handled_sp_audit = 1;
-		(void)handled_sp_audit;
+	if (__predict_false(bf_diag)) {
 		bf_sd_pending_op = op;
-		bf_sd_pending_sp = sp_before;
+		bf_sd_pending_sp = usp;
 	}
 
 	switch (op) {
@@ -596,6 +608,7 @@ bf_ctrap_priv(uint32_t *r)
 		goto defer;
 	}
 
+	if (__predict_false(bf_diag)) {
 	bf_sd_note(bf_sd_pending_op,
 	    (int32_t)(bf_usp_read() - bf_sd_pending_sp));
 
@@ -615,6 +628,7 @@ bf_ctrap_priv(uint32_t *r)
 		}
 	} else if (bf_sd_pending_op == 0x46df)
 		bf_sr_balance--;
+	}
 
 	if (__predict_false(bf_tracing))
 		f->sr |= 0x8000;	/* survive rte / move-to-sr */
@@ -690,12 +704,14 @@ bf_ctrap_aline(uint32_t *r)
 		bf_tr_window = 0;
 	}
 
+	if (__predict_false(bf_diag)) {
 	bf_al_prune(usp);
 	if (bf_al_n < BF_ALN) {
 		bf_al_sp[bf_al_n] = usp - 8;	/* the frame just pushed */
 		bf_al_pc[bf_al_n] = pc;		/* the trapping instruction */
 		bf_al_sr[bf_al_n] = sr;		/* the SR the guest had */
 		bf_al_n++;
+	}
 	}
 
 	if (__predict_false(bf_tracing))
@@ -771,6 +787,8 @@ bf_clog_ill(uint32_t *r)
 	if (__predict_false(curproc->p_pid != bf_pid))
 		return;
 
+	if (!bf_diag)
+		return;
 	bf_watch_check(bf_frame_pc(f));
 
 	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
@@ -1098,6 +1116,13 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLFLAG_READONLY, CTLTYPE_INT, "n_chain_priv",
 			    SYSCTL_DESCR("other-source vector 8 traps"),
 			    NULL, 0, &bf_n_chain_priv, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "diag",
+			    SYSCTL_DESCR("enable per-trap diagnostics "
+			        "(costs throughput; default off)"),
+			    NULL, 0, &bf_diag, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,

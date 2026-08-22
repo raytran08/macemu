@@ -287,3 +287,27 @@ Risk note: all three touch trap-level kernel code on the only machine
 this runs on.  A mistake panics it and costs an fsck.  The current state
 boots System 7.5 to the desktop and holds; these are worth doing
 deliberately, not at the end of a long session.
+
+
+## Lever 0 (done): diagnostics gated behind kern.bfast.diag
+
+Everything built during the 0x9fc0000 hunt -- the watchpoint, the A-line
+shadow stack, the stack-delta audit, the SR balance tracker and the event
+log -- ran unconditionally on every trap, including a linear search over
+up to 64 entries.  Now behind `kern.bfast.diag`, default off, so the
+whole toolkit is one sysctl away rather than deleted.
+
+Measured by toggling the flag WITHIN a single run (comparing separate
+runs is invalid -- trap rate depends entirely on what the guest is
+doing, and two runs are never in the same state):
+
+    diag=off   8,785 traps/s   67.5% system
+    diag=on    8,331 traps/s   73.0% system
+    diag=off   8,889 traps/s   66.7% system
+
+About 6%.  Worth keeping off; not the lever.
+
+Note on measuring: at an idle Finder the guest spins and trap rate is
+workload-dependent, so per-trap cost derived from idle numbers is
+unreliable.  The 31us figure came from a busy period.  Any future
+comparison must be a runtime A/B inside one run, in the same guest state.
