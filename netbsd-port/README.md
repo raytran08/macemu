@@ -723,6 +723,26 @@ demonstrably true that the System's RAM patch jumps past Basilisk's
 replacement on the Quadra 650 ROM -- but it is at most a contributing
 path, not the cause.
 
+STACK-DELTA AUDIT (clean).  Since the signature is a two-byte imbalance
+and every stack-moving instruction passes through the fast path, bfast
+now records the sp delta it produces per opcode.  Measured to the crash:
+
+    40e7 move sr,-(sp)   -2  x2695     46df move (sp)+,sr  +2  x2662
+    4e73 rte             +8  x152      007c ori #,sr        0  x3200
+    46fc move #,sr        0  x134      f4f8 cpusha          0  x592
+    40c0/40c1 move sr,dn  0            46c0/46c1 move dn,sr 0
+    40f8 move sr,abs.w    0
+
+Every delta is what the real instruction does, and every rte is format 0
+with +8.  So the emulation's stack arithmetic is correct and that whole
+class is eliminated.  (Tool: `sddump` on the target.)
+
+One observation left over, not yet explained: 40e7 outnumbers 46df by 33.
+Those are the two halves of the usual critical-section idiom, so an
+imbalance is expected only where the path exits by rte instead, and the
+rte count does not obviously account for it.  Worth a second look, though
+counts from a run that dies mid-sequence are weak evidence.
+
 --- original section follows ---
 
 ROOT CAUSE.  Dumping the RAM patch and decoding it by hand:

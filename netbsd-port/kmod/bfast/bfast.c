@@ -118,6 +118,41 @@ bf_al_prune(uint32_t sp)
 }
 static struct bf_ev_ent bf_ev[BF_EVN];
 static uint32_t	bf_ev_n;
+
+/*
+ * Stack-delta audit.
+ *
+ * The fault's signature is a two-byte imbalance, and every instruction
+ * that moves the guest stack passes through this handler.  Record, per
+ * opcode, the sp change we produce; any opcode whose delta differs from
+ * what the real instruction does is an arithmetic error in our
+ * emulation and exactly the class of bug that produces this failure.
+ */
+#define BF_SDN		64
+static uint16_t	bf_sd_op[BF_SDN];
+static int32_t	bf_sd_delta[BF_SDN];
+static uint32_t	bf_sd_count[BF_SDN];
+static int	bf_sd_n;
+static uint16_t	bf_sd_pending_op;
+static uint32_t	bf_sd_pending_sp;
+
+static void
+bf_sd_note(uint16_t op, int32_t delta)
+{
+	int i;
+
+	for (i = 0; i < bf_sd_n; i++)
+		if (bf_sd_op[i] == op && bf_sd_delta[i] == delta) {
+			bf_sd_count[i]++;
+			return;
+		}
+	if (bf_sd_n < BF_SDN) {
+		bf_sd_op[bf_sd_n] = op;
+		bf_sd_delta[bf_sd_n] = delta;
+		bf_sd_count[bf_sd_n] = 1;
+		bf_sd_n++;
+	}
+}
 static uint32_t	bf_arm_now;		/* sysctl: arm at the next priv trap */
 static uint32_t	bf_watch_addr;		/* derived: what the fatal rts pops */
 static int	bf_tracing;		/* sticky: keep T1 across SR writes */
@@ -367,6 +402,14 @@ bf_ctrap_priv(uint32_t *r)
 	if (ufetch_16((const uint16_t *)pc, &op))
 		goto defer;
 
+	{
+		uint32_t sp_before = usp;
+		int handled_sp_audit = 1;
+		(void)handled_sp_audit;
+		bf_sd_pending_op = op;
+		bf_sd_pending_sp = sp_before;
+	}
+
 	switch (op) {
 
 	case 0x40e7:				/* move sr,-(sp) */
@@ -548,6 +591,9 @@ bf_ctrap_priv(uint32_t *r)
 	default:
 		goto defer;
 	}
+
+	bf_sd_note(bf_sd_pending_op,
+	    (int32_t)(bf_usp_read() - bf_sd_pending_sp));
 
 	if (__predict_false(bf_tracing))
 		f->sr |= 0x8000;	/* survive rte / move-to-sr */
@@ -1056,6 +1102,26 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLFLAG_READONLY, CTLTYPE_INT, "trace_n",
 			    SYSCTL_DESCR("instructions logged since load"),
 			    NULL, 0, &bf_tr_n, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "sd_op",
+			    SYSCTL_DESCR("u16 opcode[64]"),
+			    NULL, 0, bf_sd_op, sizeof(bf_sd_op),
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "sd_delta",
+			    SYSCTL_DESCR("s32 sp delta[64]"),
+			    NULL, 0, bf_sd_delta, sizeof(bf_sd_delta),
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "sd_count",
+			    SYSCTL_DESCR("u32 count[64]"),
+			    NULL, 0, bf_sd_count, sizeof(bf_sd_count),
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "sd_n",
+			    SYSCTL_DESCR("distinct opcode/delta pairs"),
+			    NULL, 0, &bf_sd_n, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_INT, "events_n",
