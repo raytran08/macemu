@@ -137,13 +137,41 @@ registers sane until the last trap, no interrupt in the window.  The
 corruption happens inside the window between the final A-line trap and
 the fault, with nothing in the emulator's own trap path implicated.
 
-Remaining hypotheses, for whoever picks this up: (a) another thread --
-the 60Hz tick or XPRAM watchdog -- writing guest memory under the
-handler; (b) the guest already being in bad state from an earlier
-EMUL_OP-serviced call, with the Fixed-math loop merely where it finally
-falls over.  Static analysis is exhausted; the next instrument is
-dynamic, e.g. the 68040 trace bit to single-step from the last A-line
-trap into the handler.
+SOLVED DOWN TO THE FUNCTION, by kernel single-step tracing (bfast hooks
+vector 9; T1 is set in the frame our stub RTEs with, so setcontext never
+sees it; the userland handlers strip T1 defensively at entry).  A
+7580-instruction trace of the fatal window shows, in order:
+
+1. entry 7531: `moveml %sp@+,%d3-%d7/%a2-%a4` at 40826f6a -- a function
+   EPILOGUE restoring saved registers from 005fa18a -- loads
+   a2=09fc0000, a3=09fa0000.  The save slots fall at: d7@005fa19a,
+   a2@005fa19e, a3@005fa1a2.  Those are exactly the addresses the crash
+   later reads: the fatal rts pops 005fa19e, and the fault-time stack
+   dump shows 09fa0000 at 005fa1a2.
+2. `unlk %fp` then moves sp DOWNWARD (005fa1aa -> 005fa194), impossible
+   for a balanced frame: the frame linkage is corrupt too.
+3. the common tail at 408265f0 (reads low-mem 0x99A/0xB2A/0xB10, sets
+   0x15E) ends `moveal %sp@+,%a0; addqw #4,%sp; jmp %a0@` -- pops
+   00010f4a (a RAM hook, still sane), jumps to it; the two-instruction
+   RAM thunk at 00010f4a ends rts, which pops the overwritten a2 save
+   slot -- 09fc0000 -- into the PC.  Fetch faults; that is the crash.
+
+So the corruption event is: DURING the body of the function whose
+epilogue is at 40826f6a, its saved-register area and frame word were
+overwritten by consecutive Fixed values (two adjacent longwords, 2554.0
+and 2556.0).  That is the signature of Toolbox trap results stored
+through a displaced stack pointer -- FixRatio-family traps write their
+result to caller-reserved stack space ABOVE the return address, so an
+sp off by a constant paints results upward over the caller's frame.
+
+The trace also shows the whole visible window behaving perfectly -- the
+poison predates the window's own FixRatio calls, whose frames all sit
+safely below the save area.  What remains is to find the write itself:
+disassemble the hot function (0x40826Exx, 6010 of the 7580 traced
+instructions live there) and identify its upward stores, or arm the
+trace one A-line earlier.  The values in flight (d7=300.0, d6=3914.0,
+FixDiv by 80 and low-mem 0x9B4 nearby) suggest QuickDraw screen-
+resolution scaling during startup.
 
 Instrumentation for this is in main_unix.cpp behind the SIGSEGV dump: a
 24-entry ring of (pc, opcode, a7) filled on every signal-path trap, the

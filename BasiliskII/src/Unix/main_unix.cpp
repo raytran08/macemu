@@ -1517,6 +1517,8 @@ static void *tick_func(void *arg)
  *  Virtual 68k interrupt handler
  */
 
+unsigned long bf_t1_stripped;	/* T1 bits scrubbed before setcontext */
+
 /* Recent-trap ring; dumped by sigsegv_dump_state after a wild jump. */
 #define BF_RING 24
 struct bf_ring_ent { uint32 pc; uint32 a7; uint32 a2; uint32 a3; uint16 op; };
@@ -1564,6 +1566,39 @@ bf_dump_ring(void)
 		}
 	}
 #endif
+
+	/*
+	 * The kernel single-step ring, if bfast was tracing.  Entries wrap;
+	 * the newest is trace_n-1.  The last entry is the instruction that
+	 * computed the bad PC: the wild jump's fetch faulted before any
+	 * trace exception could log it.
+	 */
+	{
+		extern unsigned long bf_t1_stripped;
+		static struct { uint32 pc, a2, a3, usp; } ring[8192];
+		size_t rlen = sizeof(ring);
+		int n = 0;
+		size_t nlen = sizeof(n);
+
+		if (sysctlbyname("kern.bfast.trace_n", &n, &nlen, NULL, 0) == 0 &&
+		    n > 0 &&
+		    sysctlbyname("kern.bfast.trace_ring", ring, &rlen,
+		        NULL, 0) == 0) {
+			int show = n < 300 ? n : 300;
+			int k;
+
+			fprintf(stderr, "kernel trace ring: %d logged, "
+			    "T1 stripped %lu times, last %d:\n",
+			    n, bf_t1_stripped, show);
+			for (k = n - show; k < n; k++) {
+				unsigned j = (unsigned)k & 8191;
+
+				fprintf(stderr, "  pc=%08x a2=%08x a3=%08x "
+				    "usp=%08x\n", ring[j].pc, ring[j].a2,
+				    ring[j].a3, ring[j].usp);
+			}
+		}
+	}
 
 	/*
 	 * The guest's trap dispatch tables.
@@ -1673,6 +1708,30 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	__greg_t &sc_ps = gr[_REG_PS];
 	__greg_t &sc_sp = gr[_REG_A7];
 	M68kRegisters *regs = (M68kRegisters *)&gr[_REG_D0];
+
+	/*
+	 * If bfast armed single-step tracing, the interrupted context can
+	 * carry the T1 bit -- which is in PSL_MBZ, so handing it back to
+	 * setcontext() would EINVAL and kill the process (the exit(22)
+	 * mechanism).  Strip it; tracing resumes at the next armed window.
+	 */
+	if (__builtin_expect(sc_ps & 0x8000, 0)) {
+		extern unsigned long bf_t1_stripped;
+		sc_ps &= ~0x8000;
+		bf_t1_stripped++;
+	}
+
+	/*
+	 * If bfast armed single-step tracing, the interrupted context can
+	 * carry the T1 bit -- which is in PSL_MBZ, so handing it back to
+	 * setcontext() would EINVAL and kill the process (the exit(22)
+	 * mechanism).  Strip it; tracing resumes at the next armed window.
+	 */
+	if (__builtin_expect(sc_ps & 0x8000, 0)) {
+		extern unsigned long bf_t1_stripped;
+		sc_ps &= ~0x8000;
+		bf_t1_stripped++;
+	}
 
 	// Interrupts disabled? Then do nothing
 	if (EmulatedSR & 0x0700)

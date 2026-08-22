@@ -39,6 +39,7 @@ MODULE(MODULE_CLASS_MISC, bfast, NULL);
 
 #define BF_VEC_PRIV	8
 #define BF_VEC_ALINE	10
+#define BF_VEC_TRACE	9
 
 static void	*bf_alloc;
 static size_t	bf_alloclen;
@@ -55,11 +56,30 @@ struct pcb	*bf_pcb;		/* gate: registered lwp's pcb */
 static pid_t	bf_pid;			/* who registered; re-checked in C */
 uint32_t	bf_orig_priv;		/* stock vector 8 handler */
 uint32_t	bf_orig_aline;		/* stock vector 10 handler */
+uint32_t	bf_orig_trace;		/* stock vector 9 handler */
 uint32_t	bf_n_fast;		/* emulated at trap level */
 uint32_t	bf_n_defer;		/* ours, declined -> signal path */
 uint32_t	bf_n_aline;		/* ours, counted, chained (P3 pending) */
 uint32_t	bf_n_chain_priv;	/* not ours */
 uint32_t	bf_n_chain_aline;	/* not ours */
+
+/*
+ * Single-step tracing, for the 0x9fc0000 hunt.  When an A-line trap is
+ * reflected from bf_trace_arm_pc, T1 is set in the frame SR our stub
+ * RTEs with -- entirely inside the kernel, so setcontext() never sees a
+ * PS it would reject.  Every subsequent instruction raises vector 9,
+ * logged below, until the guest returns past the armed trap or the
+ * window overflows.  The fatal wild jump faults on the FETCH, before
+ * any trace exception for it, so the ring's last entry is the
+ * instruction that computed the bad PC.
+ */
+#define BF_TRN		8192		/* entries; 128KB */
+struct bf_tr_ent { uint32_t pc, a2, a3, usp; };
+static struct bf_tr_ent bf_tr[BF_TRN];
+static uint32_t	bf_tr_n;		/* total logged since load */
+static uint32_t	bf_tr_window;		/* logged in the current window */
+static uint32_t	bf_trace_arm_pc;	/* sysctl: arm on this A-line pc */
+static uint32_t	bf_tr_armed_ret;	/* pc that closes the window */
 
 /* Registered user addresses of Basilisk's virtual-SR state. */
 static uint32_t	bf_uaddr_emulsr;	/* uint16 EmulatedSR */
@@ -69,6 +89,7 @@ void bf_stub_priv(void);
 void bf_stub_aline(void);
 int bf_ctrap_priv(uint32_t *r);
 int bf_ctrap_aline(uint32_t *r);
+int bf_ctrap_trace(uint32_t *r);
 
 /*
  * Layout handed to bf_ctrap_priv: the stub pushes a pad longword, then
@@ -177,7 +198,37 @@ __asm(
 "	addql	#1,bf_n_chain_aline\n"
 "2:	movl	bf_orig_aline,%sp@-\n"
 "	rts\n"
+"\n"
+"	.even\n"
+"	.globl	bf_stub_trace\n"
+"bf_stub_trace:\n"
+"	btst	#5,%sp@\n"
+"	jne	2f\n"
+"	movl	%d0,%sp@-\n"
+"	movl	curpcb,%d0\n"
+"	cmpl	bf_pcb,%d0\n"
+"	jne	1f\n"
+"	movl	%sp@+,%d0\n"
+"	clrl	%sp@-\n"
+"	moveml	#0xffff,%sp@-\n"
+"	movl	%sp,%sp@-\n"
+"	jbsr	bf_ctrap_trace\n"
+"	addql	#4,%sp\n"
+"	tstl	%d0\n"
+"	jeq	0f\n"
+"	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
+"	rte\n"
+"0:	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
+"	movl	bf_orig_trace,%sp@-\n"
+"	rts\n"
+"1:	movl	%sp@+,%d0\n"
+"2:	movl	bf_orig_trace,%sp@-\n"
+"	rts\n"
 );
+
+void bf_stub_trace(void);
 
 /*
  * Virtual SR plumbing, mirroring main_unix.cpp:
@@ -451,6 +502,12 @@ bf_ctrap_aline(uint32_t *r)
 	bf_usp_write(usp - 8);
 	bf_frame_set_pc(f, npc);
 
+	if (__predict_false(bf_trace_arm_pc != 0 && pc == bf_trace_arm_pc)) {
+		f->sr |= 0x8000;	/* T1: trace every instruction */
+		bf_tr_armed_ret = pc + 2;
+		bf_tr_window = 0;
+	}
+
 	bf_n_aline++;
 	bf_n_fast++;
 	return 1;
@@ -458,6 +515,39 @@ bf_ctrap_aline(uint32_t *r)
 defer:
 	bf_n_defer++;
 	return 0;
+}
+
+int
+bf_ctrap_trace(uint32_t *r)
+{
+	struct bf_hwframe *f = BF_FRAME(r);
+	struct bf_tr_ent *e;
+	uint32_t pc = bf_frame_pc(f);
+
+	if (__predict_false(curproc->p_pid != bf_pid))
+		return 0;
+
+	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
+	e->pc = pc;
+	e->a2 = BF_R_A(r, 2);
+	e->a3 = BF_R_A(r, 3);
+	e->usp = bf_usp_read();
+	bf_tr_n++;
+	bf_tr_window++;
+
+	/*
+	 * Do NOT stop at the return: the first traced run showed a
+	 * completely clean _FixRatio call whose caller then died in the
+	 * very gap where tracing had been switched off.  Keep T1 until
+	 * the window overflows the ring; the guest's own SR writes clear
+	 * it anyway (bf_store_sr masks the frame SR to the ccr), and the
+	 * next armed A-line re-arms.  The ring wraps, so at the fault it
+	 * holds the last BF_TRN instructions regardless.
+	 */
+	if (bf_tr_window > BF_TRN)
+		f->sr &= 0x7fff;
+
+	return 1;
 }
 
 static inline uint32_t
@@ -528,8 +618,10 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 		memcpy(bf_table, (const void *)bf_orig_vbr, BF_TABBYTES);
 		bf_orig_priv = bf_table[BF_VEC_PRIV];
 		bf_orig_aline = bf_table[BF_VEC_ALINE];
+		bf_orig_trace = bf_table[BF_VEC_TRACE];
 		bf_table[BF_VEC_PRIV] = (uint32_t)bf_stub_priv;
 		bf_table[BF_VEC_ALINE] = (uint32_t)bf_stub_aline;
+		bf_table[BF_VEC_TRACE] = (uint32_t)bf_stub_trace;
 
 		/* cpusha %bc as raw opcode; kmod builds target 68020. */
 		__asm volatile(".word 0xf4f8");
@@ -590,6 +682,23 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLFLAG_READONLY, CTLTYPE_INT, "n_chain_priv",
 			    SYSCTL_DESCR("other-source vector 8 traps"),
 			    NULL, 0, &bf_n_chain_priv, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "trace_arm_pc",
+			    SYSCTL_DESCR("A-line pc that arms single-step "
+			        "tracing (0 = off)"),
+			    NULL, 0, &bf_trace_arm_pc, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "trace_n",
+			    SYSCTL_DESCR("instructions logged since load"),
+			    NULL, 0, &bf_tr_n, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "trace_ring",
+			    SYSCTL_DESCR("struct {u32 pc,a2,a3,usp}[8192]"),
+			    NULL, 0, bf_tr, sizeof(bf_tr),
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_INT, "n_chain_aline",
