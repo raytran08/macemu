@@ -20,6 +20,37 @@ display is the entire cost. Everything below follows from that.
 
 
 
+
+### The 0x9fc0000 fault: a Fixed value reaches the PC
+
+The System 7.5 image dies at ~18000 traps with `SIGSEGV at 0x9fc0000
+[IP=0x9fc0000]`.  Established by test: not the build (the pre-fix binary
+does it too), not the disk (a pristine copy does it too), not bfast (it
+does it with the module unloaded).
+
+The fault address is not an address.  Read as 16.16 fixed point,
+0x09fc0000 is 2556.0 -- and the guest stack at the fault holds
+0x09fa0000 (2554.0) two longwords away.  The last traps before the jump
+are a868 and a869, `_FixRatio` and `_FixMul`, running in a tight loop at
+ROM 0x408270ae-b4.  So a Fixed operand is reaching the program counter.
+
+Ruled out along the way: the A-line vector at guest 0x28 is NOT
+corrupted.  Watched across a whole run, it is written once at startup
+(0 -> 0x008099b0) and never changes, so the wild jump happens inside the
+guest's dispatcher after we vector to it correctly, not because we
+vectored somewhere wrong.
+
+Also worth noting for whoever picks this up: the guest executes ROM
+through BOTH aliases -- 0x40826xxx and 0x0080xxxx appear in the same
+trap ring -- which is the machine-specific double mapping this port
+introduced.  A trap dispatch table holding one base while execution runs
+at the other is the obvious next thing to check, along with the Fixed
+traps' return path.
+
+Instrumentation for this is in main_unix.cpp behind the SIGSEGV dump: a
+24-entry ring of (pc, opcode, a7) filled on every signal-path trap, and a
+guest stack dump at the fault.  Both cost two stores on the hot path.
+
 ### Correction: Applesex.hfv is NOT damaged; System 7.5 hits a real bug
 
 Commit 1a50cab7's message claims the System 7.5 volume is damaged.  That

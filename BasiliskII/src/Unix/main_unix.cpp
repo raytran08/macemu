@@ -309,6 +309,12 @@ static void sigsegv_dump_state(sigsegv_info_t *sip)
 	if (fault_instruction != SIGSEGV_INVALID_ADDRESS)
 		fprintf(stderr, " [IP=%p]", fault_instruction);
 	fprintf(stderr, "\n");
+#if !EMULATED_68K && defined(__NetBSD__) && defined(__m68k__)
+	{
+		extern void bf_dump_ring(void);
+		bf_dump_ring();
+	}
+#endif
 #if EMULATED_68K
 	uaecptr nextpc;
 #ifdef UPDATE_UAE
@@ -1613,6 +1619,57 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
  *  A-Trap and EMUL_OP opcodes
  */
 
+/* Recent-trap ring; dumped by sigsegv_dump_state after a wild jump. */
+#define BF_RING 24
+struct bf_ring_ent { uint32 pc; uint32 a7; uint16 op; };
+static struct bf_ring_ent bf_ring[BF_RING];
+static unsigned bf_ring_i;
+
+void bf_dump_ring(void);
+void
+bf_dump_ring(void)
+{
+	unsigned k;
+
+	/*
+	 * Guest stack at the fault.  The wild jump left a return address
+	 * behind if it was a jsr/bsr, and the dispatcher's frame is here
+	 * too; anything in ROM (0x40800000/0x00800000 alias) or low RAM is
+	 * flagged as a plausible code address.
+	 */
+	if (bf_ring_i != 0) {
+		uint32 a7 = bf_ring[(bf_ring_i - 1) & (BF_RING - 1)].a7;
+		unsigned w;
+
+		fprintf(stderr, "guest stack at %08x:\n", a7);
+		for (w = 0; w < 24; w++) {
+			uint32 at = a7 + w * 4;
+			uint32 v;
+
+			if (at < 0x1000 || at >= 0x800000)
+				break;
+			v = ReadMacInt32(at);
+			fprintf(stderr, "  %08x: %08x%s\n", at, v,
+			    (v >= 0x40800000 && v < 0x40900000) ? "  ROM(alias)" :
+			    (v >= 0x00800000 && v < 0x00900000) ? "  ROM" :
+			    (v >= 0x00001000 && v < 0x00800000) ? "  RAM" : "");
+		}
+	}
+
+	fprintf(stderr, "last %d traps before the fault, oldest first:\n",
+	    BF_RING);
+	for (k = 0; k < BF_RING; k++) {
+		unsigned j = (bf_ring_i + k) & (BF_RING - 1);
+
+		if (bf_ring[j].pc == 0)
+			continue;
+		fprintf(stderr, "  pc=%08x op=%04x a7=%08x%s\n",
+		    bf_ring[j].pc, bf_ring[j].op, bf_ring[j].a7,
+		    (bf_ring[j].op & 0xf000) == 0xa000 ? "  A-line" :
+		    (bf_ring[j].op & 0xff00) == 0x7100 ? "  EMUL_OP" : "");
+	}
+}
+
 static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 {
 	/*
@@ -1635,6 +1692,15 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 
 	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
+
+	/*
+	 * Last-N trap ring, for post-mortem after a wild jump.  No I/O on
+	 * the hot path: two stores and a mask.
+	 */
+	bf_ring[bf_ring_i & (BF_RING - 1)].pc = (uint32)sc_pc;
+	bf_ring[bf_ring_i & (BF_RING - 1)].op = opcode;
+	bf_ring[bf_ring_i & (BF_RING - 1)].a7 = (uint32)sc_sp;
+	bf_ring_i++;
 
 	/*
 	 * Opcode histogram.
@@ -1733,7 +1799,32 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 		WriteMacInt16(a7, GET_SR);
 		sc_sp = regs->a[7] = a7;
 
-		// Jump to MacOS A-Line handler on return
+		/*
+		 * Jump to MacOS A-Line handler on return.
+		 *
+		 * TEMPORARY: watch the vector itself.  A wild jump to an
+		 * unmapped address whose IP equals the fault address, taken
+		 * immediately after an A-line trap, is what corruption of
+		 * this longword would look like -- so report the moment it
+		 * changes, and refuse to jump somewhere obviously invalid.
+		 */
+		{
+			static uint32 last_vec;
+			uint32 vec = ReadMacInt32(0x28);
+
+			if (vec != last_vec) {
+				fprintf(stderr, "A-line vector @0x28: %08x -> "
+				    "%08x (at pc=%08x op=%04x)\n",
+				    last_vec, vec, (unsigned)pc,
+				    (unsigned)opcode);
+				last_vec = vec;
+			}
+			if (vec == 0 || vec >= 0x10000000) {
+				fprintf(stderr, "A-line vector is insane "
+				    "(%08x); refusing the jump\n", vec);
+				QuitEmulator();
+			}
+		}
 		sc_pc = ReadMacInt32(0x28);
 
 	} else if ((opcode & 0xff00) == 0x7100) {
