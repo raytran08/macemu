@@ -1,0 +1,129 @@
+# bfast: an in-kernel trap fast path for Basilisk II on NetBSD/mac68k
+
+## Why
+
+Measured on the Disk Tools 7.1 desktop: the machine spends 94% of its CPU
+in system time delivering emulation traps as POSIX signals, at ~1.3ms per
+trap (exception -> signal frame -> handler -> setcontext -> restore).  The
+trap mix is 59% SR bookkeeping, 35% A-line, 6% EMUL_OP.  A trap handled at
+trap level costs ~15us.  Handling the first two classes in the kernel takes
+~94% of traps off the signal path, a ~12x cut in trap load; the EMUL_OP 6%
+must keep crossing into userland (the device models live there) and bounds
+the gain.
+
+This is the hosted-hypervisor split: Basilisk II is the vmx (device
+models, EMUL_OP), the module is the vmmon (fast privileged transitions).
+No binary translation is needed -- the 68020+ traps on every sensitive
+instruction -- and no world switch: the guest is an ordinary process.
+
+## Where
+
+This module lives in the Basilisk II fork, not the OS repo: it exists
+solely to make this emulator fast.  It is coupled to NetBSD 10.1 kernel
+internals and builds against the kernel source tree in the build
+container, like the rest of the port.
+
+## Hook: VBR swap, no kernel patching
+
+NetBSD/mac68k runs with the CPU's VBR pointing at `vectab`
+(`movc %d0,%vbr`, locore.s:259; table in mac68k/vectors.s).  At load the
+module allocates a 256-entry table, copies `vectab`, replaces entries 8
+(privilege violation) and 10 (A-line) with its own stubs, and `movec`s
+the VBR to the copy.  Unload is the reverse `movec`.  The running
+kernel's own table is never written; unload is safe at any moment because
+the stubs chain to the original handlers for everything they do not
+claim.
+
+Vector 4 (illegal instruction) is NOT hooked: EMUL_OP `0x71xx` decodes as
+an illegal moveq form and arrives there, so the userland escape path is
+untouched by construction.
+
+## Fast-path gate (in the stub, in order)
+
+1. S bit set in the pushed frame's SR -> trap came from supervisor mode:
+   chain to the original vector.
+2. `_C_LABEL(curpcb)` != the registered pcb -> not our process: chain.
+   (One compare; the pcb address is stable for the life of the lwp.)
+3. Fetch the opcode at the frame PC with `moves` under `PCB_ONFAULT`
+   protection (the `suline` pattern, locore.s:918).  Fault -> chain.
+4. Opcode outside the handled set -> chain.
+
+Chaining means: undo nothing, jump to the saved original vectab entry.
+The signal path therefore remains complete and correct; the module is
+purely an accelerator and Basilisk runs unmodified without it.
+
+## Handled set and semantics (mirror main_unix.cpp exactly)
+
+Virtual SR: Basilisk registers the user addresses of `EmulatedSR` and
+`InterruptFlags`.  The stub reads/writes them with `moves` in process
+context.  The synthetic SR seen by the guest is
+`(frame ccr & 0x1f) | EmulatedSR`, same as userland's GET_SR; only
+condition-code bits ever enter the real frame SR (the exit(22) lesson --
+NetBSD rejects PSL_MBZ|PSL_IPL|PSL_S, and an RTE here feeds the frame
+that the kernel later restores).
+
+- `ori/andi/eori #imm,sr` -- update EmulatedSR + frame ccr, pc += 4.
+- `move ea,sr` for dn/(sp)+/#imm (46c0-7, 46df, 46fc) -- likewise.
+- `move sr,ea` for dn/-(sp) (40c0-7, 40e7) -- write synthetic SR out.
+- `rte` -- pop SR/PC from guest a7; frame format nibble must be 0,
+  anything else chains to the signal path.
+- `stop #imm` -- load SR as above; leave pc past it; do not sleep.
+- `cpusha` -- real `cpusha bc`; cheaper in kernel than the userland
+  FlushCodeCache round trip.
+- A-line -- push the 6-byte frame userland pushes today
+  ({SR, PC, $0028} downward on guest a7), set frame pc from guest
+  address 0x28 (guest vector table is at VA 0; the guest runs with
+  vm.user_va0_disable=0).  The guest's own dispatcher runs entirely in
+  user mode; its terminating `rte` lands back in this stub.
+
+Fallback-to-signal cases (correctness lives in userland, keep it there):
+- any SR write that LOWERS the interrupt mask while `InterruptFlags` is
+  nonzero (userland must run TriggerInterrupt);
+- `rte` with a nonzero frame format;
+- movec, stop-with-wait semantics if ever needed, anything unrecognised.
+
+Interrupt delivery (SIGURG -> sigirq_handler) is unchanged: it already
+works and is only ~60/s.
+
+## Interface
+
+sysctl, following the dafbcons precedent:
+- `kern.bfast.attach` (write: pid + the two user addresses, packed
+  struct) -- registers the caller; one process at a time; root only.
+- `kern.bfast.detach` -- clears it.  A dead process is also harmless
+  without detach: its pcb never matches again (gate 2).
+- `kern.bfast.stats` -- per-class counters (fast-pathed, chained, by
+  reason), so the census can be re-read from the kernel side.
+
+Basilisk side: one probe + attach at driver init, detach in the
+destructor, behind a pref (`fastpath true`).  No other emulator change.
+
+## Bring-up phases (each independently deployable and testable)
+
+- P0  Skeleton: load, copy vectab UNPATCHED, movec VBR, sysctl stats,
+      unload.  Proves the swap is a no-op.  Risk: near zero.
+- P1  Stubs installed but handling nothing: gate + count + chain only.
+      Proves the gate logic under full load.  Counters must match the
+      userland histogram.
+- P2  SR family fast-pathed.  Basilisk's histogram (it now sees only
+      signal-path traps) should show the SR class gone; system time
+      should drop by roughly its share.
+- P3  A-line reflection + rte.  The big one.  Histogram shows only
+      EMUL_OP; measure the real speedup.
+- P4  Tidy: drop the userland census printfs to a debug flag, write the
+      results into this file.
+
+## Risks, stated plainly
+
+A bug in a trap stub panics or wedges the physical machine (fsck on
+reboot, minutes).  Bring-up is sequenced so each phase risks little:
+P0/P1 change no behaviour, and every stub path ends in either a clean
+rte or a chain to the stock handler.  The machine is UP, so no SMP
+hazards; trap entry does not raise IPL, and the stubs use only the
+kernel stack and may be interrupted safely.
+
+Known-unknowns to watch at P3: guest RTEs of non-zero-format frames
+(chained, so correct but slow if common); the trace bit (ignored, same
+as userland today); interaction with genuine page faults on guest stack
+pushes mid-stub (PCB_ONFAULT covers the access, chain on fault, the
+signal path then repeats the work with full fault handling).
