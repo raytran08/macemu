@@ -781,6 +781,42 @@ guest, in the RAM-patch region around 0x00010exx-0x00010fxx, on every
 ROM and every image, producing a longword read two bytes low and a jump
 to 0x09fc0000.
 
+CONTEXT FROM UPSTREAM, which bears on how much more of this is worth
+chasing.  Basilisk II's own TECH manual documents native 68k mode and
+says two things directly relevant here:
+
+  "MacOS and Mac applications assume that they always run in supervisor
+   mode ... So either the whole emulator has to be run in supervisor mode
+   (which usually is not possible on multitasking systems) or priviledged
+   instructions have to be trapped and emulated."
+
+  "The Amiga and NetBSD/m68k versions of Basilisk II use the latter
+   approach [and it] makes the emulator more unstable."
+
+  "On multitasking systems, interrupts can usually not be handled as on a
+   real Mac ... The usual solution is to use some sort of software
+   interrupts or signals to interrupt the main emulation process and to
+   manually call the Mac 68k interrupt handler with a faked stack frame."
+
+So NetBSD/m68k native mode is an intended configuration, not something
+this port invented -- but its instability is a documented property of the
+approach, acknowledged by the author.  The mechanism at the heart of our
+fault (faked stack frames, trapped privileged instructions) is precisely
+what he flags as the fragile part.
+
+That does not make the fault unfixable, and this port has already found
+and fixed real bugs in exactly this area (the SR_HOST_MASK / exit(22)
+bug, and the 60Hz interrupt corrupting non-guest context).  But it does
+mean there may be no clean single defect to find: the residual failure
+may be inherent to reproducing Mac supervisor-mode semantics with
+signals, and a fix may require changing the approach rather than
+correcting an error.
+
+Searching also found no evidence that anyone has previously run System
+7.5 to a desktop under native 68k mode on NetBSD/mac68k.  The only
+NetBSD/mac68k mailing-list discussion located (1999) is an inquiry about
+whether it would be possible, not a report that it worked.
+
 --- original section follows ---
 
 ROOT CAUSE.  Dumping the RAM patch and decoding it by hand:
