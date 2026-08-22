@@ -649,8 +649,47 @@ install / bad extension" line of inquiry entirely.
 vCheckLoad fires for every resource load, and early System startup loads
 plenty.)
 
-So the remaining candidate is the first: the resume path selects the
-wrong frame.  That is guest/ROM-patch territory rather than emulator
+THE "RESUME PATH" IS JUST A FUNCTION RETURN, and calling it a resume path
+was my own misreading.  Disassembled in full:
+
+    408265f0:  moveal 0x99a,%a0        a0 = [0x99A]
+    408265f4:  tstl   %a0@
+    408265f6:  bnes   0x40826612       -> the taken path in BOTH passes
+    408265f8:  movel  %a0,%sp@-        (skipped)
+    ...
+    40826612:  moveal 0xb2a,%a0
+    40826616:  movel  %a0@,0xb10
+    4082661a:  st     0x15e
+    4082661e:  moveal %sp@+,%a0        pop the caller's return address
+    40826620:  addqw  #4,%sp
+    40826622:  jmp    %a0@             ...and return to it
+
+The trace confirms the bnes path is taken in both the healthy and the
+fatal pass (sp is identical at 408265f0 and at 4082661e, so nothing is
+pushed in between).  So this is an ordinary tail-return: the caller's
+return address is popped and jumped to.  Reached from 40826f7a, which is
+`unlk %fp; braw 408265f0`, the popped value is simply the return address
+of the function whose frame was just unlinked.
+
+Which means BOTH values are correct.  The hook calls this code twice, so
+returning to 00010f2a (after its first a815) and to 00010f4a (after its
+second) are equally legitimate.  There is no wrong-frame selection and
+nothing here is malfunctioning.
+
+THE REAL QUESTION, restated once more and now much narrower: returning to
+00010f4a executes `addql #2,a7; rts` -- the hook discarding the two-byte
+result of its _SCSIDispatch call and returning.  For that to work, the
+a815 at 00010f48 must have consumed its 14 bytes of parameters and left a
+2-byte result.  The rts instead pops rubbish, so the stack after that
+trap is not what the hook expects.
+
+And we already know something odd about that exact trap: selector 4 never
+reaches Basilisk's _SCSIDispatch replacement, though the a815 certainly
+traps and certainly carries selector 4.  Something else is servicing it
+and not cleaning up the way the caller requires.  Finding what handles
+A815 selector 4 on this system is the next concrete step, and the
+dispatcher instrumentation already in bfast (008099c6 logs the resolved
+table entry) can answer it directly.  That is guest/ROM-patch territory rather than emulator
 territory -- which is consistent with everything else that has been
 cleared here, and means the next work is understanding what that resume
 path is FOR (which trap it is entitled to resume, and how it is supposed
