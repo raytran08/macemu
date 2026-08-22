@@ -737,7 +737,27 @@ inner entry point as well -- e.g. patching 0x408266b4 too, or patching
 the RAM routine's jump target once it is installed.  Both need care:
 the inner entry is reached with the selector already popped, so the
 replacement's stack arithmetic (which expects `ret, selector` on entry)
-does not apply unchanged there.  That is guest/ROM-patch territory rather than emulator
+does not apply unchanged there.
+
+ROM SURVEY (System 7.5, same disk image, three ROMs):
+
+  Quadra 650  (ours)    boots into the System, dies at 0x9fc0000.
+                        Selector 4 never reaches our replacement.
+  Mac IIci    512KB     NO CRASH.  SCSI traps DO reach the replacement
+                        (selectors 0/1/2 arriving), but the guest loops
+                        probing the SCSI bus and ends at the flashing
+                        question mark: no boot device.
+  Quadra 700/900 1MB    SIGILL on opcode ffe4 at 0000dc86, clean exit.
+
+The IIci result CONFIRMS the root-cause analysis: change the ROM and the
+System's bypass stops happening, so the traps arrive where Basilisk put
+its replacement.  The bypass is specific to this ROM/System pairing, not
+a general property of System 7.5.
+
+It also raises a separate question, to be kept apart from the SCSI one:
+under the IIci ROM the guest scans SCSI for a boot device at all, which
+means Basilisk's disk-driver patching is not taking effect there, while
+under the Quadra 650 ROM it plainly does.  That is an independent gap.  That is guest/ROM-patch territory rather than emulator
 territory -- which is consistent with everything else that has been
 cleared here, and means the next work is understanding what that resume
 path is FOR (which trap it is entitled to resume, and how it is supposed
