@@ -194,3 +194,52 @@ The guest's Toolbox dispatcher runs entirely via kernel reflection: push
 {SR, PC, $0028} on the guest stack, vector through guest 0x28, and the
 dispatcher's terminating RTE lands in the vector-8 handler that P2
 proved.  The emulator process is not woken at all for either class.
+
+## Current state and how to run it
+
+Working: the module loads, attaches to one emulator process, and handles the
+SR family and A-line reflection at trap level.  Disk Tools 7.1 boots to the
+Finder and runs indefinitely on it.  Bring-up phases P0-P3 are all proven on
+the machine; P4 (tidying the userland census behind a debug flag) is not done,
+and is harmless as it stands -- the census now fires only every 100k
+SIGNAL-path traps, which with the fast path loaded takes a very long time.
+
+    # build both, in the container
+    docker run --rm -v nbwork:/work -v "$PWD":/out debian:12 \
+        sh /out/netbsd-port/build-bfast.sh
+    docker run --rm -v nbwork:/work -v "$PWD":/out debian:12 \
+        sh /out/netbsd-port/build-basilisk.sh
+
+    # on the target, as root
+    /sbin/modload ./bfast.kmod
+    ./runbii.sh            # writes run2.log / status2.txt
+    /sbin/sysctl kern.bfast
+
+`runbii.sh` on the target carries the invocation, which matters: the RAM size
+must be **8MB** (`--ramsize 8388608`).  The default is too small for System 7.5
+and 16MB relocates the ROM from 0x800000 to 0x1000000, changing the memory map
+entirely.  That invocation was reconstructed twice by guesswork at the cost of
+a run each time; it is written down now so it need not be guessed again.
+
+Attach is automatic: BasiliskII registers the addresses of EmulatedSR and
+InterruptFlags and then its own lwp, immediately before Start680x0, and detaches
+in QuitEmulator.  With the module absent every sysctl simply fails and the
+emulator runs unchanged on the signal path.
+
+Counters worth watching: `n_fast` (handled at trap level), `n_defer` (ours,
+declined to the signal path -- expect well under 1%), `n_chain_priv` /
+`n_chain_aline` (traps from other processes or supervisor mode; these should be
+exactly zero, and have been across every run).
+
+## Not done
+
+- P4 tidy: the userland opcode census and the trap ring are still compiled in
+  unconditionally.  They cost two stores per trap and earn their keep while the
+  0x9fc0000 bug is open; they should go behind a flag once it is closed.
+- System 7.5 is unvalidated, blocked by that bug (see README.md).  Every
+  measurement here is from Disk Tools 7.1, which is a lighter and more
+  idle-heavy workload than a full System with extensions; expect a larger
+  EMUL_OP share, and therefore a smaller multiple, on real work.
+- The module is 68040-only and NetBSD 10.1-specific: it reads curpcb, assumes
+  the mac68k VBR arrangement, and emits cpusha as a raw opcode because kmod
+  builds target the 68020 baseline.
