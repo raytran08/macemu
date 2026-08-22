@@ -446,6 +446,24 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 			}
 			r->a[0] = ret;			// "rtd" emulation, a0 = return address, a1 = new stack pointer
 			r->a[1] = r->a[7] + stack;
+#if defined(__NetBSD__) && defined(__m68k__)
+			/*
+			 * TEMPORARY.  Establish the stack convention by
+			 * observation rather than inference: for each call,
+			 * the caller's pc, the selector, the stack pointer
+			 * as the trap found it, the sp we hand back, and the
+			 * words around the return site.  A caller whose own
+			 * cleanup disagrees with a1 by two bytes is the bug.
+			 */
+			{
+				uint32 sp_in = r->a[7] - 6; /* before our +=6 */
+				fprintf(stderr, "scsi: sel=%2d ret=%08x "
+				    "sp_in=%08x sp_out=%08x stack=%d "
+				    "[ret]=%04x %04x\n",
+				    sel, ret, sp_in, r->a[1], stack,
+				    ReadMacInt16(ret), ReadMacInt16(ret + 2));
+			}
+#endif
 			break;
 		}
 

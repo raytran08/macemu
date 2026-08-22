@@ -256,9 +256,33 @@ this caller's shape -- three longword pushes, a word selector, then
 addql #2,a7 -- needs checking against that assumption, because a
 two-byte disagreement here produces precisely the observed skew.
 
-Do NOT simply subtract 2 to make it balance.  Establish the convention
-first: log a7 in and out per selector, compare against what each caller
-does afterwards, and fix the one that is actually wrong.
+Measured, and _SCSIDispatch is INNOCENT.  Logging every call through the
+replacement shows just 15 in an entire boot, all selectors 1 and 2
+(SCSIGet, SCSISelect) from ROM 0x8073xx, on an unrelated stack.
+Selector 4 -- the one the hook pushes -- NEVER EXECUTES.
+
+Which explains itself once the addresses are compared: the guest does not
+enter the hook at its start (0x00010f2a) but 32 bytes in, at 0x00010f4a,
+which is the `addql #2,a7; rts` tail.  The SCSI call at 10f48 is skipped
+entirely.  So the causal chain is:
+
+  1. the resume tail at 40826622 does `jmp (a0)` with a0 popped off the
+     stack, and a0 holds 00010f4a where a healthy pass holds 00010f2a;
+  2. 00010f4a is `addql #2,a7`, which skews the stack by two;
+  3. the following `rts` therefore pops a misaligned longword -- the
+     09fc/09fa pushes read two bytes low -- into the PC;
+  4. the fetch faults at 0x09fc0000.
+
+So the two-byte skew is a CONSEQUENCE, not the cause, and the previous
+commit's suspicion of the SCSIDispatch stack arithmetic is withdrawn.
+The single remaining question is step 1: why does the stack slot that the
+resume tail pops hold 00010f4a?  Note what that value is -- the return
+address of the A-line trap at 00010f48 -- so a stale trap return address
+is being consumed as a resume address.
+
+Next instrument: watch the slot the resume tail pops (derive it from usp
+at 40826620, exactly as the last watchpoint was derived from usp at the
+rts) and report every write to it, with the writing pc.
 
 Two tracer improvements needed before the next round, both learnt here:
 - gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into
