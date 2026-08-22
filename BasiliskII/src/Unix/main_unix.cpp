@@ -101,6 +101,11 @@ using std::string;
 #include "prefs_editor.h"
 #include "macos_util.h"
 #include "adb.h"
+
+/* BII_TRACE_REARM=1: keep kernel tracing alive across signal handlers.
+   Off by default: self-sustaining tracing wraps the ring thousands of
+   times and destroys any record of early boot. */
+static bool bf_trace_rearm;
 #include "user_strings.h"
 #include "version.h"
 #include "main.h"
@@ -1192,6 +1197,9 @@ int main(int argc, char **argv)
 	 * is irrelevant and the trace covers everything; if it disappears
 	 * the interrupt is causal.  Either answer is decisive.
 	 */
+	if (getenv("BII_TRACE_REARM") != NULL)
+		bf_trace_rearm = true;
+
 	if (getenv("BII_NO_TICK") != NULL) {
 		extern bool tick_inhibit;
 		tick_inhibit = true;
@@ -1871,11 +1879,14 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 		bf_t1_stripped++;
 		/*
 		 * We had to drop T1 (setcontext rejects it), which silently
-		 * ends the kernel trace.  Ask bfast to re-arm at the next
-		 * fast-pathed privileged op so the window continues.
+		 * ends the kernel trace.  Re-arming keeps a window going,
+		 * but ONLY on request: left unconditional it makes tracing
+		 * self-sustaining, which wraps the ring thousands of times
+		 * over and destroys any record of early boot.
 		 */
-		sysctlbyname("kern.bfast.arm_now", NULL, NULL,
-		    &one, sizeof(one));
+		if (bf_trace_rearm)
+			sysctlbyname("kern.bfast.arm_now", NULL, NULL,
+			    &one, sizeof(one));
 	}
 
 	/*
@@ -1892,11 +1903,14 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 		bf_t1_stripped++;
 		/*
 		 * We had to drop T1 (setcontext rejects it), which silently
-		 * ends the kernel trace.  Ask bfast to re-arm at the next
-		 * fast-pathed privileged op so the window continues.
+		 * ends the kernel trace.  Re-arming keeps a window going,
+		 * but ONLY on request: left unconditional it makes tracing
+		 * self-sustaining, which wraps the ring thousands of times
+		 * over and destroys any record of early boot.
 		 */
-		sysctlbyname("kern.bfast.arm_now", NULL, NULL,
-		    &one, sizeof(one));
+		if (bf_trace_rearm)
+			sysctlbyname("kern.bfast.arm_now", NULL, NULL,
+			    &one, sizeof(one));
 	}
 
 	// Interrupts disabled? Then do nothing
@@ -1964,7 +1978,7 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	 * The T1 bit cannot be set here: it is in PSL_MBZ and setcontext
 	 * would refuse the context.  Absent the module this simply fails.
 	 */
-	{
+	if (bf_trace_rearm) {
 		static int one = 1;
 		sysctlbyname("kern.bfast.arm_now", NULL, NULL,
 		    &one, sizeof(one));

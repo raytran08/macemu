@@ -755,9 +755,29 @@ its replacement.  The bypass is specific to this ROM/System pairing, not
 a general property of System 7.5.
 
 It also raises a separate question, to be kept apart from the SCSI one:
-under the IIci ROM the guest scans SCSI for a boot device at all, which
-means Basilisk's disk-driver patching is not taking effect there, while
-under the Quadra 650 ROM it plainly does.  That is an independent gap.  That is guest/ROM-patch territory rather than emulator
+under the IIci ROM the guest scans SCSI for a boot device at all, and
+ends at the flashing question mark.
+
+Chasing that turned up a TOOLING BUG worth knowing about.  The trace
+ring appeared to show that INSTALL_DRIVERS (patched in at ROM+0x1142)
+never fired -- under either ROM.  That was false: the ring had wrapped
+2.7 MILLION entries deep, because the "re-arm tracing after stripping
+T1" logic added earlier made tracing self-sustaining.  sigirq_handler
+re-armed on every interrupt delivery, so tracing effectively never
+stopped and every record of early boot was overwritten within seconds.
+Re-arming is now opt-in behind BII_TRACE_REARM=1.
+
+With tracing genuinely off the ring holds ~1600 entries for a whole boot,
+and INSTALL_DRIVERS DOES fire exactly once under the IIci ROM.  So the
+drivers are installed and the earlier reading was an artefact.  What
+happens after that -- whether the .Sony driver is ever called, and if so
+what it returns -- is the open end of this thread.  The EMUL_OP marker
+records the guest pc but not the opcode, so matching calls to specific
+EmulOps needs the opcode added to the marker: a small module change.
+
+Note on earlier results: the findings that identified the SCSI bypass
+came from the EVENT log (a separate 256-entry array) and from
+disassembly, neither of which is affected by ring wrap.  They stand.  That is guest/ROM-patch territory rather than emulator
 territory -- which is consistent with everything else that has been
 cleared here, and means the next work is understanding what that resume
 path is FOR (which trap it is entitled to resume, and how it is supposed
