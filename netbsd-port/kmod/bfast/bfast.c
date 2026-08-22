@@ -782,7 +782,9 @@ bf_ctrap_trace(uint32_t *r)
 	    pc == 0x40826f78 || pc == 0x40826f6a ||
 	    pc == 0x408268ca ||
 	    pc == 0x00010f28 || pc == 0x00010f48 ||
-	    pc == 0x00010f2a || pc == 0x00010f4a)) {
+	    pc == 0x00010f2a || pc == 0x00010f4a ||
+	    pc == 0x008099b0 || pc == 0x008099b8 ||
+	    pc == 0x008099c6 || pc == 0x008099d6)) {
 		struct bf_ev_ent *v = &bf_ev[bf_ev_n & (BF_EVN - 1)];
 		uint32_t sp = bf_usp_read();
 
@@ -799,6 +801,19 @@ bf_ctrap_trace(uint32_t *r)
 
 			v->a0 = (ufetch_32((const uint32_t *)sp, &ra) == 0) ?
 			    ra : 0xffffffffu;
+		} else if (pc == 0x008099d6) {
+			uint32_t h;
+
+			/* rts is about to jump to [sp]: the handler */
+			v->a0 = (ufetch_32((const uint32_t *)sp, &h) == 0) ?
+			    h : 0xffffffffu;
+		} else if (pc == 0x008099b8) {
+			uint32_t tw;
+
+			/* a2 holds the trap pc; read the trap word itself */
+			v->a0 = (ufetch_16((const uint16_t *)BF_R_A(r, 2),
+			    (uint16_t *)&tw) == 0) ? (tw & 0xffff) : 0xffffffffu;
+			v->a0 = BF_R_A(r, 2);	/* the trapping pc */
 		} else
 			v->a0 = BF_R_A(r, 0);
 		bf_al_prune(sp);

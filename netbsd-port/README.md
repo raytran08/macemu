@@ -569,11 +569,36 @@ selector 4.  Something between the trap and the replacement is
 mis-dispatching, and given the crash lands in the return from that exact
 trap, those two facts are likely the same fact.
 
-NEXT: log the return path of the a815 at 00010f48 specifically -- where
-the dispatcher sends it, and what the stack looks like when it comes
-back.  The instrument is already in place; it needs the dispatcher's
-entry (008099b0) and the handler address it computes added to the event
-pc list.
+Done: with the dispatcher instrumented (960 events in a run), the frame
+stack at the failure point is fully visible:
+
+    frame[-0] from 40826a8e at sp 005fa17e
+    frame[-1] from 00010f48 at sp 005fa18e   <- hook's SECOND a815
+    frame[-2] from 00010f28 at sp 005fa196   <- hook's FIRST a815
+    frame[-3] from 00010ea2 at sp 005fa19e
+
+Three A-line traps nested at exact 8-byte intervals, with BOTH of the
+hook's a815s in flight at once.  That is the precondition for the
+failure: a resume path that selects a frame by stack position has two
+almost identical candidates 8 bytes apart, and picks the wrong one.
+
+Caveat on the instrument, so the depth numbers are not over-read: the
+shadow stack judges liveness by stack pointer, and the ROM dispatcher
+converts its frame in place (into [handler][return]) rather than popping
+it, so a converted frame still counts as live until sp rises past its
+address.  The DEPTH is therefore an upper bound; the FRAME LIST and the
+addresses are exact, and it is the addresses that matter here.
+
+WHERE IT STANDS.  The failure needs two things that are now both
+established: the hook nests two a815 traps whose frames sit 8 bytes
+apart, and a generic resume path pops a return address by stack position.
+What is not yet pinned is which of those two is wrong -- whether the
+resume path should be pointed at a different frame, or whether trap #2
+should never have been taken while trap #1 was in flight (i.e. whether
+our A-line reflection permits a nesting the real hardware would not).
+The second is the one that would put the defect back in this port, and
+it is testable: compare the guest's SR/interrupt state at trap #2 against
+what a real 68040 would have had after trap #1.
 
 Superseded options, kept for the record:
 1. Emulate the faulting store inside the SIGSEGV handler (decode the
