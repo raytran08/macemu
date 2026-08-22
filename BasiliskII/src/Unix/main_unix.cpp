@@ -271,12 +271,77 @@ static int vm_acquire_mac_fixed(void *addr, size_t size)
 #endif
 
 /*
+ *  Stack-write watch (diagnostic, for the 0x9fc0000 hunt)
+ *
+ *  Single-stepping cannot see the write that poisons [005fa194]: it lands
+ *  in the gap after an EMUL_OP, where T1 has necessarily been stripped.
+ *  Page protection does not care about trap state.  The page is written
+ *  constantly, so arming is triggered on the exact predecessor value the
+ *  kernel watchpoint recorded (0x31300000 -> 0x00010f4a); the very next
+ *  write to the page then faults and names its instruction.
+ */
+#define BW_SLOT		0x005fa194u
+#define BW_TRIGGER	0x31300000u
+static uintptr	bw_page;		/* protected page, 0 = disarmed */
+static bool	bw_fired;
+
+static bool	bw_active;		/* trigger seen: keep re-arming */
+
+static void bw_arm_if_ready(void)
+{
+	long ps;
+
+	if (bw_fired || bw_page != 0)
+		return;
+	if (!bw_active) {
+		if (ReadMacInt32(BW_SLOT) != BW_TRIGGER)
+			return;
+		bw_active = true;
+	}
+
+	ps = sysconf(_SC_PAGESIZE);
+	bw_page = (uintptr)Mac2HostAddr(BW_SLOT) & ~(uintptr)(ps - 1);
+	if (mprotect((void *)bw_page, ps, PROT_READ) != 0) {
+		fprintf(stderr, "stack watch: mprotect failed: %s\n",
+		    strerror(errno));
+		bw_page = 0;
+		bw_fired = true;
+		return;
+	}
+}
+
+/*
  *  SIGSEGV handler
  */
 
 static sigsegv_return_t sigsegv_handler(sigsegv_info_t *sip)
 {
 	const uintptr fault_address = (uintptr)sigsegv_get_fault_address(sip);
+
+	/* Stack-write watch: name the writer, then get out of the way. */
+	if (bw_page != 0) {
+		long ps = sysconf(_SC_PAGESIZE);
+
+		if (fault_address >= bw_page &&
+		    fault_address < bw_page + (uintptr)ps) {
+			const void *ip = sigsegv_get_fault_instruction_address(sip);
+
+			bool ours = (fault_address >= BW_SLOT &&
+			    fault_address < BW_SLOT + 4);
+
+			fprintf(stderr, "STACK WATCH%s: write to %08lx by "
+			    "instruction at %p  (slot now %08x)\n",
+			    ours ? " *** THE SLOT ***" : "",
+			    (unsigned long)fault_address, ip,
+			    (unsigned)ReadMacInt32(BW_SLOT));
+			mprotect((void *)bw_page, ps,
+			    PROT_READ | PROT_WRITE | PROT_EXEC);
+			bw_page = 0;
+			if (ours)
+				bw_fired = true;	/* done: stop re-arming */
+			return SIGSEGV_RETURN_SUCCESS;
+		}
+	}
 #if ENABLE_VOSF
 	// Handle screen fault
 	extern bool Screen_fault_handler(sigsegv_info_t *sip);
@@ -2039,6 +2104,8 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 		sc_pc = ReadMacInt32(0x28);
 
 	} else if ((opcode & 0xff00) == 0x7100) {
+
+		bw_arm_if_ready();
 
 		// Extended opcode, push registers on user stack
 		uint32 a7 = regs->a[7];

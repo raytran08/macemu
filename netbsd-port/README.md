@@ -400,12 +400,48 @@ Exonerated by direct test: the build, the disk image, bfast, the A-line
 vector, the Toolbox dispatch table, the ROM alias, EMUL_OP register
 save/restore, the 60Hz tick, _SCSIDispatch, and now the ROM fill loop.
 
-The one technique left that does not depend on T1: mprotect the guest
-stack page read-only and let the existing SIGSEGV path name the faulting
-instruction.  It needs care -- the stack is written constantly, so it
-must be armed late (e.g. from the EMUL_OP just before the window) and
-disarmed immediately after reporting -- but it is the only instrument
-that sees writes regardless of trap state.
+The mprotect technique was built and works, but does not isolate this
+write, for a reason that closes off the whole family of approaches.
+
+Implementation: arm on the exact predecessor value the kernel watchpoint
+recorded (0x31300000), protect the page, report the faulting instruction
+from the existing SIGSEGV path, unprotect, re-arm at the next EMUL_OP.
+It caught five writes to the page and, critically, the slot CHANGED
+between two consecutive catches:
+
+    write to 005fa112 by 0x802bf6e   (slot still 31300000)
+    write to 005fa108 by 0x802bf6e   (slot now   00010f4a)
+
+Neither touched 005fa194.  The poisoning write happens in the interval
+when the page is unprotected -- which it must be, because a faulting
+store has to be allowed to complete, and re-protecting after exactly one
+instruction requires single-stepping, i.e. T1, which is what could not be
+used in the first place.  Page granularity plus no single-step equals no
+isolation.
+
+WHERE THIS LEAVES IT.  Every component has been cleared by direct test:
+build, disk, bfast, A-line vector, dispatch table, ROM alias, EMUL_OP
+register save/restore, the 60Hz tick, _SCSIDispatch, the ROM fill loop.
+The chain from the poisoned slot to the fault is proven instruction by
+instruction.  What is not known is which instruction writes 00010f4a into
+[005fa194], and the three obvious instruments (single-step, sampled
+watchpoint, page protection) each fail for the same structural reason:
+the write occurs in a stretch where no trap-based instrument is live.
+
+Remaining options, in order of soundness:
+1. Emulate the faulting store inside the SIGSEGV handler (decode the
+   instruction, perform the write, skip it) so the page NEVER has to be
+   unprotected.  This is the correct fix to the technique above and is
+   self-contained -- a small m68k store decoder for the handful of forms
+   that appear.
+2. Have bfast maintain a shadow copy of the slot and compare it at every
+   trap of ANY kind (it currently checks at privileged ops and EMUL_OPs;
+   adding A-line reflection roughly triples the sampling rate and may be
+   enough to bracket the write to a few instructions).
+3. Accept the bracket already established -- the write lands between the
+   trace going dark at 40826e88 and the EMUL_OP at 0086c6ea -- and read
+   the ROM between those points by disassembly, looking for a store that
+   could reach 0x5fa194.
 
 Two tracer improvements needed before the next round, both learnt here:
 - gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into
