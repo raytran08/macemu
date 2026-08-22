@@ -91,6 +91,7 @@ enum {
 	M68K_EMUL_OP_DEBUGUTIL,
 	M68K_EMUL_OP_IDLE_TIME,
 	M68K_EMUL_OP_SUSPEND,
+	M68K_EMUL_OP_SCSI_DISPATCH_D0,	// SCSIDispatch with selector in d0
 	M68K_EMUL_OP_MAX				// highest number
 };
 

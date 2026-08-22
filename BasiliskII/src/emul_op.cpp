@@ -386,11 +386,25 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 			r->d[0] = SoundInClose(r->a[0], r->a[1]);
 			break;
 
-		case M68K_EMUL_OP_SCSI_DISPATCH: {	// SCSIDispatch() replacement
-			uint32 ret = ReadMacInt32(r->a[7]);		// Get return address
-			uint16 sel = ReadMacInt16(r->a[7] + 4);	// Get selector
+		case M68K_EMUL_OP_SCSI_DISPATCH_D0: {
+			// System 7.5's own A815 handler pops the selector into
+			// d0 and re-pushes only the return address before
+			// jumping into ROM SCSI internals.  The resource patch
+			// in rsrc_patches.cpp replaces that jump (and the
+			// preceding link) with this op, so the frame here is
+			// [ret][args...] with the selector in d0.
+			uint32 ret; uint16 sel; int stack;
+			ret = ReadMacInt32(r->a[7]);
+			sel = r->d[0] & 0xffff;
+			r->a[7] += 4;
+			goto scsi_dispatch_common;
+
+		case M68K_EMUL_OP_SCSI_DISPATCH:	// SCSIDispatch() replacement
+			ret = ReadMacInt32(r->a[7]);		// Get return address
+			sel = ReadMacInt16(r->a[7] + 4);	// Get selector
 			r->a[7] += 6;
-			int stack = 0;
+scsi_dispatch_common:
+			stack = 0;
 			switch (sel) {
 				case 0:		// SCSIReset
 					WriteMacInt16(r->a[7], SCSIReset());

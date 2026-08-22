@@ -304,6 +304,8 @@ static void bw_arm_if_ready(void)
 {
 	long ps;
 
+	if (getenv("BII_STACK_WATCH") == NULL)
+		return;
 	if (bw_fired || bw_page != 0)
 		return;
 	if (!bw_active) {
@@ -2039,20 +2041,21 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	static unsigned long irq_deferred, irq_delivered;
 
 	/*
-	 * Guest code lives in TWO ranges, and the second was missing here.
-	 * RAM from 0 with ROM above it, AND the ROM's hardware alias at
-	 * 0x40800000, which this ROM genuinely executes from -- every trap
-	 * ring in netbsd-port/README.md is full of 0x40826xxx addresses.
+	 * Deliver only when the pc is in LOW guest range; defer for
+	 * everything else, INCLUDING the ROM alias at 0x40800000.
 	 *
-	 * Testing only the low range deferred EVERY interrupt that arrived
-	 * while the guest was running aliased ROM, which is most of them:
-	 * the logs show deferred counts running level with delivered.  The
-	 * guest was being starved of ticks for long stretches and then
-	 * handed a backlog on the way back down to low addresses.
+	 * This was briefly "fixed" to deliver into aliased ROM on the
+	 * theory that the alias is guest code too (it is) and deferral was
+	 * starving it (it was not: deferred interrupts re-trigger from
+	 * EmulOpTrampoline promptly).  The kernel trace then caught an
+	 * interrupt delivered at 0x40807ae0 -- inside a ROM queue-walker
+	 * that runs as a critical section -- followed directly by the
+	 * process dying.  On real hardware the mask blocks delivery there;
+	 * in this port the mask is virtual and the SIGURG can land at any
+	 * instruction, so NOT delivering into ROM at all is what makes the
+	 * faked-frame injection safe in practice.  Deferral is correct.
 	 */
-	if (((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) &&
-	    !((uint32)sc_pc >= ROM_ALIAS_BASE &&
-	      (uint32)sc_pc <  ROM_ALIAS_BASE + ROM_MAX_SIZE)) {
+	if ((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) {
 		/*
 		 * Not in guest code, so a frame built here would capture a
 		 * host pc.  Leave the interrupt PENDING rather than losing

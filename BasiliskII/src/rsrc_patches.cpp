@@ -87,6 +87,39 @@ void CheckLoad(uint32 type, int16 id, uint8 *p, uint32 size)
 {
 	uint16 *p16;
 	uint32 base;
+
+	/*
+	 * System 7.5's SCSI patch installs an A815 handler that pops the
+	 * selector into d0, re-pushes the return address, and jumps straight
+	 * into the ROM SCSI Manager's internals -- bypassing the trap-table
+	 * entry Basilisk patched.  Under emulation that runs real ROM SCSI
+	 * code against hardware that does not exist, and the caller ends up
+	 * popping its own parameter bytes as a return address (the
+	 * deterministic wild jump to 0x09fc0000).
+	 *
+	 * Rewrite the handler as it loads, whatever resource it arrives in:
+	 * replace its `link %fp,#-6; jmp $408266b4` (the Quadra 650 internal
+	 * entry) with an EMUL_OP that takes this frame shape, plus the
+	 * standard glue.  Scanned on every resource because the hosting
+	 * type/ID is not documented.
+	 */
+	{
+		static const uint8 scsi_d0_dat[] = {0x4e, 0x56, 0xff, 0xfa,
+		    0x4e, 0xf9, 0x40, 0x82, 0x66, 0xb4};
+		base = find_rsrc_data(p, size, scsi_d0_dat, sizeof(scsi_d0_dat));
+		if (base) {
+			p16 = (uint16 *)(p + base);
+			*p16++ = htons(M68K_EMUL_OP_SCSI_DISPATCH_D0);
+			*p16++ = htons(0x2e49);		// move.l	a1,a7
+			*p16++ = htons(M68K_JMP_A0);
+			*p16++ = htons(M68K_NOP);
+			*p16 = htons(M68K_NOP);
+			FlushCodeCache(p + base, 10);
+			printf("SCSI D0-handler patched in rsrc %c%c%c%c %d\n",
+			    (char)(type >> 24), (char)(type >> 16),
+			    (char)(type >> 8), (char)type, id);
+		}
+	}
 	D(bug("vCheckLoad %c%c%c%c (%08x) ID %d, data %p, size %d\n", (char)(type >> 24), (char)((type >> 16) & 0xff), (char )((type >> 8) & 0xff), (char )(type & 0xff), type, id, p, size));
 	
 	if (type == FOURCC('b','o','o','t') && id == 3) {
