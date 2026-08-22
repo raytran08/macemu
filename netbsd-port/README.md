@@ -1814,3 +1814,31 @@ is a proportional saving if one is ever needed.
 - `fbcoexist.c` — the coexistence probe described above. Deliberately
   never restores `MODE_EMUL`: handing the console back while X is drawing
   is what corrupts the display.
+
+
+## THE 0x9fc0000 FAULT IS FIXED (see commit bff033e9)
+
+First principles located it.  The fault value is the SCSI probe's OWN
+`pea 0x9fc` parameter read two bytes low; the two bytes are the selector
+that System 7.5's RAM A815 handler pops into d0 before jumping straight
+into ROM SCSI internals -- bypassing Basilisk's trap-entry replacement,
+running real SCSI code against absent hardware.
+
+Fix: M68K_EMUL_OP_SCSI_DISPATCH_D0 (dispatch variant for the handler's
+frame shape, selector in d0) plus a CheckLoad resource patch that
+rewrites the handler as it loads.  Verified: the kernel EMUL_OP log shows
+opcode 0x7139 executing at 0x0000f10c inside the loaded handler; the
+probe's SCSIStat arrives with a correct frame; the wild jump is gone
+across multiple runs.
+
+Also learned: the interrupt guard's alias-blindness was PROTECTIVE
+(delivering into aliased ROM planted a faked frame inside the ROM
+queue-walker critical section at 40807ae0, then death) -- reverted, with
+reasoning in the code.  Hypothesis five was right but pre-armed.  And
+bfast attach returns EBUSY after a crashed run until the module is
+reloaded; runs then silently lose the fast path.
+
+NEW LATER FAILURE, now the frontier: SIGBUS (exit 138) in the probe's
+continuation, which addresses Quadra hardware registers (0xFFFFExxx)
+directly.  SIGBUS was added to the handled set on NetBSD/m68k but the
+postmortem does not fire for it yet -- investigate that first.
