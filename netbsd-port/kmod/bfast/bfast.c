@@ -66,6 +66,7 @@ uint32_t	bf_n_chain_priv;	/* not ours */
 uint32_t	bf_n_chain_aline;	/* not ours */
 uint32_t	bf_n_emulop;		/* EMUL_OPs that reach userland */
 uint32_t	bf_n_bmove;		/* BLOCK_MOVE handled in-kernel */
+uint32_t	bf_n_emulop_fast;	/* EMUL_OPs delivered without a signal */
 static struct timespec bf_eo_t0;	/* entry time of a sampled EMUL_OP */
 static int	bf_eo_pending;
 static uint32_t	bf_eo_ns;		/* EMUL_OP trap -> next trap, sampled */
@@ -202,6 +203,7 @@ static uint32_t	bf_clock_ns;	/* cost of nanouptime itself */
 /* Registered user addresses of Basilisk's virtual-SR state. */
 static uint32_t	bf_uaddr_emulsr;	/* uint16 EmulatedSR */
 static uint32_t	bf_uaddr_intflags;	/* uint32 InterruptFlags */
+static uint32_t	bf_uaddr_tramp;		/* EmulOpTrampoline entry */
 
 void bf_stub_priv(void);
 void bf_stub_aline(void);
@@ -878,8 +880,53 @@ bf_clog_ill(uint32_t *r)
 	 * The ROM patch is EMUL_OP; moveq #0,d0; rts -- so simply stepping
 	 * the pc past the EMUL_OP lets the guest run the rest natively.
 	 */
-	if (ufetch_16((const uint16_t *)bf_frame_pc(f), &eop) == 0 &&
-	    eop == 0x7130) {
+	if (ufetch_16((const uint16_t *)bf_frame_pc(f), &eop) != 0)
+		return 0;
+
+	/*
+	 * Deliver EMUL_OP without a signal.
+	 *
+	 * sigill_handler's 0x71xx path builds a register frame on the guest
+	 * stack and jumps to EmulOpTrampoline.  Doing exactly that here
+	 * skips the whole signal round trip -- frame construction,
+	 * delivery, and the setcontext() on the way back -- which is
+	 * ~1.3ms against roughly 30us of stores.  The layout must match
+	 * main_unix.cpp byte for byte, because the trampoline reads the
+	 * saved pc at a0@(66):
+	 *
+	 *   S-4   pc of the EMUL_OP        S-6   sr (word)
+	 *   S-10  a7 (the ORIGINAL sp)     ...   a6..a0 down to S-38
+	 *   S-42  d7                       ...   d0 down to S-70
+	 *   new sp = S-70, pc = EmulOpTrampoline
+	 */
+	if (bf_uaddr_tramp != 0 && (eop & 0xff00) == 0x7100 &&
+	    eop != 0x7130) {
+		uint32_t S = bf_usp_read();
+		uint16_t sr;
+		int i, bad = 0;
+
+		if (bf_get_sr(f, &sr))
+			return 0;
+
+		bad |= ustore_32((uint32_t *)(S - 4), bf_frame_pc(f));
+		bad |= ustore_16((uint16_t *)(S - 6), sr);
+		bad |= ustore_32((uint32_t *)(S - 10), S);	/* a7 */
+		for (i = 6; i >= 0; i--)
+			bad |= ustore_32((uint32_t *)(S - 10 - 4 * (7 - i)),
+			    BF_R_A(r, i));
+		for (i = 7; i >= 0; i--)
+			bad |= ustore_32((uint32_t *)(S - 42 - 4 * (7 - i)),
+			    BF_R_D(r, i));
+		if (bad)
+			return 0;			/* fall back to signals */
+
+		bf_usp_write(S - 70);
+		bf_frame_set_pc(f, bf_uaddr_tramp);
+		bf_n_emulop_fast++;
+		return 1;
+	}
+
+	if (eop == 0x7130) {
 		__asm volatile(".word 0xf4f8");	/* cpusha bc */
 		bf_frame_set_pc(f, bf_frame_pc(f) + 2);
 		bf_n_bmove++;
@@ -1199,6 +1246,17 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLTYPE_INT, "uaddr_emulsr",
 			    SYSCTL_DESCR("user address of EmulatedSR"),
 			    NULL, 0, &bf_uaddr_emulsr, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "uaddr_tramp",
+			    SYSCTL_DESCR("EmulOpTrampoline entry point"),
+			    NULL, 0, &bf_uaddr_tramp, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_emulop_fast",
+			    SYSCTL_DESCR("EMUL_OPs delivered without a signal"),
+			    NULL, 0, &bf_n_emulop_fast, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,

@@ -380,3 +380,40 @@ fbshot, which takes ~20s and competes with the emulator for the CPU.
   process with SIGILL and no output at all.
 - **--idlewait true**: hangs the guest.  See above.
 - **Gating the diagnostics**: ~6%.  Worth having, not a lever.
+
+
+## Lever: deliver EMUL_OPs without a signal (system time 53% -> 35%)
+
+The remaining EMUL_OPs after BLOCK_MOVE are all genuine userland work --
+DISK_PRIME (file I/O), IRQ, CHECKLOAD, ADBOP -- so none of them can move
+into the kernel.  But the DELIVERY MECHANISM can.
+
+sigill_handler's 0x71xx path builds a register frame on the guest stack
+and jumps to EmulOpTrampoline.  bfast now does exactly that itself and
+rte's straight to the trampoline, so an EMUL_OP costs ~30us of stores
+instead of a full signal round trip (~1.3ms): no signal frame, no
+delivery, no setcontext() on the way back.  Userland registers the
+trampoline address via kern.bfast.uaddr_tramp; if it is unset, or any
+store faults, the trap falls through to the signal path unchanged.
+
+The frame layout must match main_unix.cpp byte for byte, because the
+trampoline reads the saved pc at a0@(66):
+
+    S-4   pc of the EMUL_OP      S-6   sr (word)
+    S-10  a7 (the ORIGINAL sp)   ...   a6..a0 down to S-38
+    S-42  d7                     ...   d0 down to S-70
+    new sp = S-70, pc = EmulOpTrampoline
+
+Measured over a boot:
+
+    CPU user/system   47/53  ->  65/35
+    EMUL_OPs by signal          8,313 -> 0
+    boot to settled      76s  ->  73s
+
+Boot barely moves because it is disk-bound, but the guest now gets 65% of
+the machine instead of 47% -- a 39% increase in execution time, which is
+what interactive work feels.  Verified by screenshot: System 7.5 renders
+the startup dialog correctly, no corruption.
+
+Combined with the BLOCK_MOVE change, system time is down from 75% to
+35% and boot from 104s to 73s.

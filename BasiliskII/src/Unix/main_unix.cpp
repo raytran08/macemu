@@ -1181,6 +1181,17 @@ int main(int argc, char **argv)
 		int a1 = (int)(uintptr_t)&EmulatedSR;
 		int a2 = (int)(uintptr_t)&InterruptFlags;
 
+		int a3 = (int)(uintptr_t)&EmulOpTrampoline;
+
+		/*
+		 * Hand bfast the trampoline entry so it can deliver EMUL_OPs
+		 * by building the register frame and rte-ing straight here,
+		 * instead of raising SIGILL and going the whole way round
+		 * through signal delivery and setcontext().
+		 */
+		sysctlbyname("kern.bfast.uaddr_tramp", NULL, NULL,
+		    &a3, sizeof(a3));
+
 		if (sysctlbyname("kern.bfast.uaddr_emulsr", NULL, NULL,
 		        &a1, sizeof(a1)) == 0 &&
 		    sysctlbyname("kern.bfast.uaddr_intflags", NULL, NULL,
