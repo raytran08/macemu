@@ -90,7 +90,30 @@ static uint32_t	bf_tr_armed_ret;	/* pc that closes the window */
  * the SAME code path possible within one run.
  */
 #define BF_EVN		256
-struct bf_ev_ent { uint32_t pc, sp, fp, a0; };
+struct bf_ev_ent { uint32_t pc, sp, fp, a0, aln, alpc; };
+
+/*
+ * Shadow stack of live A-line frames.
+ *
+ * The ROM's A-line dispatcher does NOT consume its frame with rte -- it
+ * rewrites the frame in place into [handler][return] and leaves via rts
+ * (see 8099c6..8099d6).  So frames cannot be matched to returns; instead
+ * a frame recorded at guest sp S is live while sp <= S and gone once sp
+ * has risen past it.  Pruning on that rule at every trap gives the count
+ * of A-line frames currently on the guest stack, which is exactly the
+ * quantity that differs by one between a healthy and a fatal pass.
+ */
+#define BF_ALN		32
+static uint32_t	bf_al_sp[BF_ALN];
+static uint32_t	bf_al_pc[BF_ALN];
+static int	bf_al_n;
+
+static void
+bf_al_prune(uint32_t sp)
+{
+	while (bf_al_n > 0 && sp > bf_al_sp[bf_al_n - 1])
+		bf_al_n--;
+}
 static struct bf_ev_ent bf_ev[BF_EVN];
 static uint32_t	bf_ev_n;
 static uint32_t	bf_arm_now;		/* sysctl: arm at the next priv trap */
@@ -337,6 +360,7 @@ bf_ctrap_priv(uint32_t *r)
 	int st;
 
 	bf_watch_check(pc);
+	bf_al_prune(bf_usp_read());
 
 	if (ufetch_16((const uint16_t *)pc, &op))
 		goto defer;
@@ -597,6 +621,13 @@ bf_ctrap_aline(uint32_t *r)
 		bf_tr_window = 0;
 	}
 
+	bf_al_prune(usp);
+	if (bf_al_n < BF_ALN) {
+		bf_al_sp[bf_al_n] = usp - 8;	/* the frame just pushed */
+		bf_al_pc[bf_al_n] = pc;		/* the trapping instruction */
+		bf_al_n++;
+	}
+
 	if (__predict_false(bf_tracing))
 		f->sr |= 0x8000;
 
@@ -767,6 +798,9 @@ bf_ctrap_trace(uint32_t *r)
 			    ra : 0xffffffffu;
 		} else
 			v->a0 = BF_R_A(r, 0);
+		bf_al_prune(sp);
+		v->aln = (uint32_t)bf_al_n;
+		v->alpc = bf_al_n > 0 ? bf_al_pc[bf_al_n - 1] : 0;
 		bf_ev_n++;
 	}
 
@@ -987,7 +1021,7 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "events",
-			    SYSCTL_DESCR("struct {u32 pc,sp,fp,a0}[256]"),
+			    SYSCTL_DESCR("struct {u32 pc,sp,fp,a0,aln,alpc}[256]"),
 			    NULL, 0, bf_ev, sizeof(bf_ev),
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,

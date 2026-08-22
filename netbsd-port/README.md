@@ -509,15 +509,43 @@ Catching the entry itself needs tracing armed before 408268ca, which
 means a much larger traced window; walking further up the call chain this
 way gets progressively more expensive.
 
-BETTER NEXT INSTRUMENT.  The skew is exactly one A-line frame, and A-line
-frames are pushed by our own reflection code, so count them instead of
-chasing them: in bfast, push the guest sp onto a small shadow stack at
-each A-line reflection and pop/compare at each rte that consumes an
-A-line-shaped frame.  A divergence identifies the exact trap whose frame
-is never consumed -- which is the leak -- without needing to trace any of
-the intervening code.  Mind that the Mac ROM legitimately unwinds past
-frames in places, so the shadow stack needs a resync rule rather than a
-strict assertion.
+SHADOW STACK BUILT, AND IT REFRAMES THE BUG AGAIN.
+
+Frames cannot be matched to returns -- the ROM dispatcher consumes its
+A-line frame with rts, not rte -- so liveness is tracked by stack
+pointer: a frame recorded at sp S is live while sp <= S, pruned once sp
+rises past it.  Pruning at every trap gives the number of A-line frames
+live on the guest stack.  Result:
+
+    healthy:  aline_depth=7  top frame from the a-line at 00010f28
+    fatal:    aline_depth=6  top frame from the a-line at 00010f48
+
+And the hook, disassembled properly this time, calls _SCSIDispatch TWICE:
+
+    00010f24:  movew  #10,-(sp)      selector 10 (SCSIStat)
+    00010f28:  a815                  trap #1 -- returns to 00010f2a
+    ...
+    00010f44:  movew  #4,-(sp)       selector 4 (SCSIComplete)
+    00010f48:  a815                  trap #2 -- returns to 00010f4a
+
+So 00010f2a and 00010f4a are the return addresses of the FIRST and SECOND
+a815 in the same hook.  The resume tail at 408265f0 is a generic
+"resume the interrupted A-line" path, and it pops whichever return
+address is at [sp]: in the healthy pass trap #1's, in the fatal pass
+trap #2's.  IT RESUMES THE WRONG NESTED TRAP.
+
+That also explains the earlier confusion about entering the hook "32
+bytes in": the guest is not jumping into the middle of a routine, it is
+correctly returning from a different trap than the one being resumed.
+
+The question is now sharp and small: this resume path selects an A-line
+frame to return to, and in the fatal pass one extra frame (trap #2's) is
+interposed above the one it wants.  Either the resume path is reached
+with an extra nested A-line in flight, or trap #1's frame has been
+consumed early.  bfast's shadow stack can answer this directly -- log the
+full frame list, not just the depth and top, at the resume tail and at
+each a815 in this hook -- and that is a small change to an instrument
+that now works.
 
 Superseded options, kept for the record:
 1. Emulate the faulting store inside the SIGSEGV handler (decode the
