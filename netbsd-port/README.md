@@ -18,6 +18,36 @@ So applications inside the emulator run at the host's real speed and the
 display is the entire cost. Everything below follows from that.
 
 
+
+### Trap census: what an in-kernel fast path must cover
+
+Measured on the Disk Tools 7.1 desktop (histogram built into
+`sigill_handler`, dumped every 100k traps; the 100k-200k delta excludes
+boot).  The machine spends 94% of its CPU in the kernel delivering these
+as signals, at ~1.3ms per trap against ~15us for a trap handled at trap
+level, so the mix below is the design input for a vmmon-style module:
+
+    SR bookkeeping   59%   007c ori #,sr (11%), 40e7 move sr,-(sp) (8%),
+                           46df move (sp)+,sr (8%), 40c0 move sr,d0 (5%),
+                           4e73 rte (4%), 46fc move #,sr (4%),
+                           46c0 move d0,sr (2%), f4f8 cpusha (2%), tail
+    A-line (toolbox) 35%   a822, a02e, a055, a030, a0dd, abf7, long tail
+    EMUL_OP (71xx)    6%   must reach userland: the device models live
+                           there; this class bounds any speedup
+
+Covering the first two classes in the kernel -- virtual-SR bookkeeping
+and exception reflection onto the guest's own A-line vector -- takes ~94%
+of traps off the signal path.  At 15us/1300us that cuts the trap load
+roughly 12x; what remains is almost entirely EMUL_OP delivery, which is
+Amdahl's share and cannot move without moving the device models.
+
+The opcode set the module must handle is small and closed: the SR family
+(ori/andi/move to and from SR, rte, stop), cpusha, and blind A-line
+reflection.  Everything else -- EMUL_OP, movec, genuinely illegal
+opcodes -- falls through to the existing signal path unchanged, which
+also keeps the emulator fully functional with the module absent.
+
+
 ### Do not give the DGA window a blank X cursor
 
 The obvious tidy-up -- `XDefineCursor` an empty pixmap cursor on the

@@ -1601,27 +1601,57 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	uint16 *pc = (uint16 *)sc_pc;
 	uint16 opcode = *pc;
 
-
-	/* TEMPORARY: is the guest progressing, or going in circles? */
+	/*
+	 * Opcode histogram.
+	 *
+	 * Design input for an in-kernel fast path: which operations must it
+	 * cover, and how much of the load is EMUL_OP -- the class that has
+	 * to keep crossing into userland and so bounds any speedup.  One
+	 * counter per opcode word (256KB, nothing on this machine), dumped
+	 * every 100000 traps so no manner of exit can lose it.
+	 */
 	{
+		static uint32 op_hist[65536];
 		static unsigned long n;
-		static uint32 seen[8];
-		static int nseen;
 
-		if ((++n % 2000) == 0) {
-			int i, fresh = 0;
+		op_hist[opcode]++;
+		if ((++n % 100000) == 0) {
+			uint32 top[16]; int ti, tn = 0, i2;
+			unsigned long aline = 0, emulop = 0, other = 0;
+			unsigned op;
 
-			for (i = 0; i < nseen; i++)
-				if (seen[i] == (uint32)sc_pc)
-					break;
-			if (i == nseen) {
-				fresh = 1;
-				if (nseen < 8)
-					seen[nseen++] = (uint32)sc_pc;
+			for (op = 0; op < 65536; op++) {
+				uint32 c = op_hist[op];
+				if (c == 0)
+					continue;
+				if ((op & 0xf000) == 0xa000)
+					aline += c;
+				else if ((op & 0xff00) == 0x7100)
+					emulop += c;
+				else
+					other += c;
+				for (ti = 0; ti < tn; ti++)
+					if (c > op_hist[top[ti]])
+						break;
+				if (ti < 16) {
+					for (i2 = (tn < 16 ? tn : 15);
+					    i2 > ti; i2--)
+						top[i2] = top[i2 - 1];
+					top[ti] = op;
+					if (tn < 16)
+						tn++;
+				}
 			}
-			fprintf(stderr, "trap %lu: pc=%08x op=%04x%s\n",
-			    n, (unsigned)sc_pc, (unsigned)opcode,
-			    fresh ? " (new pc)" : "");
+			fprintf(stderr, "hist %lu: a-line %lu (%lu%%)  "
+			    "emulop %lu (%lu%%)  other %lu (%lu%%)\n",
+			    n, aline, aline * 100 / n,
+			    emulop, emulop * 100 / n,
+			    other, other * 100 / n);
+			for (ti = 0; ti < tn; ti++)
+				fprintf(stderr, "  op %04x  %9u  %2u%%\n",
+				    top[ti], op_hist[top[ti]],
+				    (unsigned)((uint64)op_hist[top[ti]] *
+				        100 / n));
 		}
 	}
 
