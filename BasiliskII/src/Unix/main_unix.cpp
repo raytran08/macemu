@@ -1575,7 +1575,7 @@ bf_dump_ring(void)
 	 */
 	{
 		extern unsigned long bf_t1_stripped;
-		static struct { uint32 pc, a2, a3, usp; } ring[8192];
+		static struct { uint32 pc, a2, fp, usp; } ring[32768];
 		size_t rlen = sizeof(ring);
 		int n = 0;
 		size_t nlen = sizeof(n);
@@ -1591,11 +1591,11 @@ bf_dump_ring(void)
 			    "T1 stripped %lu times, last %d:\n",
 			    n, bf_t1_stripped, show);
 			for (k = n - show; k < n; k++) {
-				unsigned j = (unsigned)k & 8191;
+				unsigned j = (unsigned)k & 32767;
 
-				fprintf(stderr, "  pc=%08x a2=%08x a3=%08x "
+				fprintf(stderr, "  pc=%08x a2=%08x fp=%08x "
 				    "usp=%08x\n", ring[j].pc, ring[j].a2,
-				    ring[j].a3, ring[j].usp);
+				    ring[j].fp, ring[j].usp);
 			}
 		}
 	}

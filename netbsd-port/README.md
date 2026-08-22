@@ -166,12 +166,40 @@ sp off by a constant paints results upward over the caller's frame.
 
 The trace also shows the whole visible window behaving perfectly -- the
 poison predates the window's own FixRatio calls, whose frames all sit
-safely below the save area.  What remains is to find the write itself:
-disassemble the hot function (0x40826Exx, 6010 of the 7580 traced
-instructions live there) and identify its upward stores, or arm the
-trace one A-line earlier.  The values in flight (d7=300.0, d6=3914.0,
-FixDiv by 80 and low-mem 0x9B4 nearby) suggest QuickDraw screen-
-resolution scaling during startup.
+safely below the save area.  Three further rounds (a data watchpoint piggybacked on the trace, and a
+healthy-vs-fatal iteration comparison) narrow it to this:
+
+- The "clobbered save area" was a red herring: the watchpoint shows the
+  write at 005fa19e is an ordinary PUSH by the RAM hook at 00010f3a in a
+  SHALLOWER, healthy context.  The values there are stale leftovers, not
+  corruption.
+- The real defect is DEPTH, not data.  A healthy iteration runs the
+  common resume tail (408265f0: pops a resume address, skips 4, jmp)
+  at usp=005fa19c and pops 00010f2a, the RAM hook entry.  The fatal
+  iteration runs the SAME tail at usp=005fa194 -- exactly 8 bytes,
+  one exception frame, deeper -- and pops 00010f4a, which is a stale
+  A-line RETURN address (trap at 00010f48, +2), landing in the hook's
+  rts thunk, which then returns into loose Fixed data.
+- The 60Hz interrupt is implicated by direct observation: in the fatal
+  run the userland trap ring records *** INTERRUPT *** delivered at
+  0081b6d6 (a table-scan loop) a handful of traps before the death, and
+  the crash follows within ~5 traps.  The same delivery is what blinds
+  the kernel tracer (sigirq must strip T1 from the interrupted context,
+  because T1 is in PSL_MBZ and setcontext would refuse it).
+
+Working hypothesis, one instrument from proof: the common tail at
+408265f0 is shared between a normal path and an interrupt-return path
+whose stack carries one extra 8-byte frame; the 60Hz delivery -- either
+by its placement or by how the guest's IRQ glue unwinds through this
+region -- leaves the tail entered at the wrong depth.  Next instrument:
+kernel-side interrupt markers in the trace ring (the userland ring has
+them; the kernel ring does not yet), plus tracing armed from the IRQ
+vector (0x64) rather than from an A-line, so the delivery-to-death
+window is captured whole.
+
+Tracer limitation to remember: any 60Hz delivery inside a traced window
+kills the trace (the T1 strip), so windows that need to survive an
+interrupt must be re-armed from the interrupt path itself.
 
 Instrumentation for this is in main_unix.cpp behind the SIGSEGV dump: a
 24-entry ring of (pc, opcode, a7) filled on every signal-path trap, the

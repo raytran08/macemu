@@ -73,8 +73,8 @@ uint32_t	bf_n_chain_aline;	/* not ours */
  * any trace exception for it, so the ring's last entry is the
  * instruction that computed the bad PC.
  */
-#define BF_TRN		8192		/* entries; 128KB */
-struct bf_tr_ent { uint32_t pc, a2, a3, usp; };
+#define BF_TRN		32768		/* entries; 640KB */
+struct bf_tr_ent { uint32_t pc, a2, fp, usp; };
 static struct bf_tr_ent bf_tr[BF_TRN];
 static uint32_t	bf_tr_n;		/* total logged since load */
 static uint32_t	bf_tr_window;		/* logged in the current window */
@@ -517,20 +517,51 @@ defer:
 	return 0;
 }
 
+/*
+ * Data watchpoint, piggybacked on the single-step trace: the address a
+ * previous run proved gets clobbered (the a2 save slot of the function
+ * whose epilogue is at 40826f6a; the run is fully reproducible).  When
+ * its value changes between traced instructions, a marker entry is
+ * logged carrying the pc of the instruction that JUST COMPLETED -- the
+ * writer -- which is the previous entry's pc, since a trace exception
+ * reports the NEXT instruction.
+ */
+#define BF_WATCH_ADDR	0x005fa19eu
+#define BF_MARK_WRITE	0xdeadbeefu
+
 int
 bf_ctrap_trace(uint32_t *r)
 {
 	struct bf_hwframe *f = BF_FRAME(r);
 	struct bf_tr_ent *e;
 	uint32_t pc = bf_frame_pc(f);
+	static uint32_t watch_last;
+	static int watch_valid;
+	uint32_t wv;
 
 	if (__predict_false(curproc->p_pid != bf_pid))
 		return 0;
 
+	if (ufetch_32((const uint32_t *)BF_WATCH_ADDR, &wv) == 0) {
+		if (watch_valid && wv != watch_last) {
+			uint32_t wpc = bf_tr_n ?
+			    bf_tr[(bf_tr_n - 1) & (BF_TRN - 1)].pc : 0;
+
+			e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
+			e->pc = BF_MARK_WRITE;
+			e->a2 = watch_last;	/* old value */
+			e->fp = wv;		/* new value */
+			e->usp = wpc;		/* the writing instruction */
+			bf_tr_n++;
+		}
+		watch_last = wv;
+		watch_valid = 1;
+	}
+
 	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
 	e->pc = pc;
 	e->a2 = BF_R_A(r, 2);
-	e->a3 = BF_R_A(r, 3);
+	e->fp = BF_R_A(r, 6);
 	e->usp = bf_usp_read();
 	bf_tr_n++;
 	bf_tr_window++;
@@ -697,7 +728,7 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "trace_ring",
-			    SYSCTL_DESCR("struct {u32 pc,a2,a3,usp}[8192]"),
+			    SYSCTL_DESCR("struct {u32 pc,a2,fp,usp}[32768]"),
 			    NULL, 0, bf_tr, sizeof(bf_tr),
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
