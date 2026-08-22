@@ -600,7 +600,14 @@ bf_ctrap_trace(uint32_t *r)
 	 * hook's rts at 00010f4c pops [usp]; arm the address the first time
 	 * we step that instruction, then report every change to it.
 	 */
-	if (__predict_false(pc == 0x00010f4c && bf_watch_addr == 0))
+	/*
+	 * Watch the slot the resume tail pops.  At 40826620
+	 * (`moveal %sp@+,%a0`) the value about to become a0 sits at [usp];
+	 * a healthy pass finds 00010f2a there, the fatal one 00010f4a.
+	 * Arm on the first pass and report every write afterwards, with
+	 * the writing pc -- that is the whole remaining question.
+	 */
+	if (__predict_false(pc == 0x40826620 && bf_watch_addr == 0))
 		bf_watch_addr = bf_usp_read();
 
 	if (bf_watch_addr != 0 &&

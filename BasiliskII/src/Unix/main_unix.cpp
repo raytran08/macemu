@@ -1100,6 +1100,24 @@ int main(int argc, char **argv)
 	}
 #endif
 
+#if defined(__NetBSD__) && defined(__m68k__)
+	/*
+	 * TEMPORARY, diagnostic: BII_NO_TICK=1 suppresses the 60Hz tick.
+	 * The crash hunt has an unavoidable blind spot -- sigirq_handler
+	 * must strip T1 before setcontext sees the context, so the window
+	 * between an interrupt and the next privileged instruction cannot
+	 * be single-stepped, and the fault falls inside it.  Removing the
+	 * tick removes the blind spot: if the fault persists the interrupt
+	 * is irrelevant and the trace covers everything; if it disappears
+	 * the interrupt is causal.  Either answer is decisive.
+	 */
+	if (getenv("BII_NO_TICK") != NULL) {
+		extern bool tick_inhibit;
+		tick_inhibit = true;
+		fprintf(stderr, "60Hz tick INHIBITED (diagnostic)\n");
+	}
+#endif
+
 	// Start 68k and jump to ROM boot routine
 	D(bug("Starting emulation...\n"));
 	Start680x0();
@@ -1733,8 +1751,17 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	 */
 	if (__builtin_expect(sc_ps & 0x8000, 0)) {
 		extern unsigned long bf_t1_stripped;
+		static int one = 1;
+
 		sc_ps &= ~0x8000;
 		bf_t1_stripped++;
+		/*
+		 * We had to drop T1 (setcontext rejects it), which silently
+		 * ends the kernel trace.  Ask bfast to re-arm at the next
+		 * fast-pathed privileged op so the window continues.
+		 */
+		sysctlbyname("kern.bfast.arm_now", NULL, NULL,
+		    &one, sizeof(one));
 	}
 
 	/*
@@ -1745,8 +1772,17 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	 */
 	if (__builtin_expect(sc_ps & 0x8000, 0)) {
 		extern unsigned long bf_t1_stripped;
+		static int one = 1;
+
 		sc_ps &= ~0x8000;
 		bf_t1_stripped++;
+		/*
+		 * We had to drop T1 (setcontext rejects it), which silently
+		 * ends the kernel trace.  Ask bfast to re-arm at the next
+		 * fast-pathed privileged op so the window continues.
+		 */
+		sysctlbyname("kern.bfast.arm_now", NULL, NULL,
+		    &one, sizeof(one));
 	}
 
 	// Interrupts disabled? Then do nothing

@@ -284,6 +284,38 @@ Next instrument: watch the slot the resume tail pops (derive it from usp
 at 40826620, exactly as the last watchpoint was derived from usp at the
 rts) and report every write to it, with the writing pc.
 
+That was tried and could not fire, for a reason worth recording because
+it bounds this whole technique.
+
+THE 60Hz TICK IS NOT CAUSAL.  A diagnostic switch (BII_NO_TICK=1)
+suppresses one_tick entirely; the fault persists unchanged.  Interrupts
+are exonerated -- which also disposes of the "interrupt-return depth"
+theory for good.
+
+THE TRACER HAS A STRUCTURAL BLIND SPOT.  T1 lives in PSL_MBZ, so any
+context that reaches setcontext must have it stripped, and every EMUL_OP
+takes exactly that path: 0x71xx decodes as an illegal instruction,
+arrives at vector 4 (which bfast deliberately does not hook, so the
+userland escape keeps working), and returns through the signal
+trampoline.  Stepping therefore ends at the first EMUL_OP after arming.
+Re-arming from the strip site (both handlers now set kern.bfast.arm_now)
+does not close it: re-arming takes effect at the next fast-pathed
+PRIVILEGED op, and if the guest faults before executing one, the window
+between is invisible.
+
+Consistent with that, three separate runs -- with and without the tick,
+with and without re-arming -- all end their trace at the same
+instruction, the `rtd #8` at 0081c38c that exits _FixRatio.  It is not
+the faulting instruction: it leaves sp at 005fa182 while the fault
+reports a7=005fa1a2, so roughly 32 bytes of further stack activity
+happen unseen after it.
+
+To close the blind spot, bfast should hook vector 4 purely as a LOGGER:
+record the pc of every EMUL_OP into the trace ring and chain immediately
+to the stock handler, handling nothing.  That gives continuity across the
+untraceable stretches without changing behaviour, and costs one ring
+entry per EMUL_OP.
+
 Two tracer improvements needed before the next round, both learnt here:
 - gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into
   the emulator's own code and libc, so a wrapped ring can be entirely
