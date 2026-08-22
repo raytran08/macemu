@@ -133,6 +133,10 @@ static uint16_t	bf_sd_op[BF_SDN];
 static int32_t	bf_sd_delta[BF_SDN];
 static uint32_t	bf_sd_count[BF_SDN];
 static int	bf_sd_n;
+static int32_t	bf_sr_balance;		/* 40e7 pushes minus 46df pops */
+static int32_t	bf_sr_worst;
+static uint32_t	bf_sr_worst_pc;
+static uint32_t	bf_sr_last_push_pc;
 static uint16_t	bf_sd_pending_op;
 static uint32_t	bf_sd_pending_sp;
 
@@ -594,6 +598,23 @@ bf_ctrap_priv(uint32_t *r)
 
 	bf_sd_note(bf_sd_pending_op,
 	    (int32_t)(bf_usp_read() - bf_sd_pending_sp));
+
+	/*
+	 * `move sr,-(sp)` / `move (sp)+,sr` are the two halves of the usual
+	 * critical-section idiom.  A persistent excess of pushes means some
+	 * path leaves without restoring -- track the running balance and
+	 * remember where it last reached a new high, which names the code
+	 * responsible rather than merely counting.
+	 */
+	if (bf_sd_pending_op == 0x40e7) {
+		bf_sr_balance++;
+		bf_sr_last_push_pc = pc;
+		if (bf_sr_balance > bf_sr_worst) {
+			bf_sr_worst = bf_sr_balance;
+			bf_sr_worst_pc = pc;
+		}
+	} else if (bf_sd_pending_op == 0x46df)
+		bf_sr_balance--;
 
 	if (__predict_false(bf_tracing))
 		f->sr |= 0x8000;	/* survive rte / move-to-sr */
@@ -1117,6 +1138,21 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "sd_count",
 			    SYSCTL_DESCR("u32 count[64]"),
 			    NULL, 0, bf_sd_count, sizeof(bf_sd_count),
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "sr_balance",
+			    SYSCTL_DESCR("40e7 pushes minus 46df pops"),
+			    NULL, 0, &bf_sr_balance, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "sr_worst",
+			    SYSCTL_DESCR("highest balance reached"),
+			    NULL, 0, &bf_sr_worst, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "sr_worst_pc",
+			    SYSCTL_DESCR("pc where that high was reached"),
+			    NULL, 0, &bf_sr_worst_pc, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_INT, "sd_n",

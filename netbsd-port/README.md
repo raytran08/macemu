@@ -757,11 +757,29 @@ That closes the "our emulation miscounts the stack" hypothesis
 completely.  Whatever produces the two-byte skew is not an arithmetic
 error in either handler.
 
-One observation left over, not yet explained: 40e7 outnumbers 46df by 33.
-Those are the two halves of the usual critical-section idiom, so an
-imbalance is expected only where the path exits by rte instead, and the
-rte count does not obviously account for it.  Worth a second look, though
-counts from a run that dies mid-sequence are weak evidence.
+The leftover 40e7/46df imbalance was chased and is NOT a leak.  Tracking
+the running balance and the pc where it reaches each new high: it peaks
+at 421 outstanding pushes and comes back down to 35 by the crash.  A
+balance that returns is interleaved nesting across contexts, not code
+failing to restore.  The site involved (0080a3e4, `movew %sr,%sp@-`
+followed by `oriw #0x0700,%sr`) is an ordinary interrupt-masking critical
+section in the ADB path, and the ~35 outstanding at the end is simply
+whatever was in flight when the guest died.
+
+So that lead is closed too.  (Tools left behind: kern.bfast.sr_balance,
+sr_worst, sr_worst_pc.)
+
+SUMMARY OF WHAT IS ELIMINATED, all by direct test rather than argument:
+the disk image, the System install, extensions/INITs, the 60Hz tick and
+interrupt delivery generally, the ROM (three tried), the Toolbox dispatch
+table, the A-line vector, EMUL_OP register save/restore, the SCSI
+_SCSIDispatch bypass, the stack arithmetic in the kernel fast path, the
+stack arithmetic in the userland path, and the SR push/pop balance.
+
+What remains true and unexplained: a two-byte stack skew appears in the
+guest, in the RAM-patch region around 0x00010exx-0x00010fxx, on every
+ROM and every image, producing a longword read two bytes low and a jump
+to 0x09fc0000.
 
 --- original section follows ---
 
