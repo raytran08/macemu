@@ -1,21 +1,26 @@
 /*
  * bfast - in-kernel trap fast path for Basilisk II on NetBSD/mac68k.
  *
- * Phase 0: prove the hook mechanism and nothing else.
+ * Phase 2: the SR-bookkeeping family is emulated at trap level; A-line
+ * still counts and chains (that is P3).
  *
- * The whole module rests on one manoeuvre: the mac68k kernel runs with
- * the CPU's VBR pointing at vectab (locore.s), so exception routing can
- * be changed for the entire machine with a single movc of the VBR to a
- * private copy of the table -- and changed back just as atomically.  The
- * kernel's own table is never written.  Later phases patch entries 8
- * (privilege violation) and 10 (A-line) in the COPY; this phase installs
- * an identical copy, which must be a no-op.
+ * Structure: the vector stubs (asm) do only the cheap gate -- trap from
+ * user mode, current pcb is the registered pcb -- and then call a C
+ * handler with the saved register block.  The C handler either emulates
+ * the instruction and returns nonzero, in which case the stub restores
+ * registers and executes RTE directly (no signal, no chain), or returns
+ * zero WITHOUT HAVING MUTATED ANYTHING, in which case the stub chains to
+ * the stock handler and the signal path repeats the instruction from
+ * scratch.  Decide-before-mutate is what makes chaining always correct.
  *
- * If the machine survives modload/modunload cycles and runs normally in
- * between, the hook is sound.  Everything after that is just what the
- * stubs do.
+ * The semantics are a line-for-line relocation of the privileged-
+ * instruction switch in BasiliskII's main_unix.cpp sigill_handler; the
+ * virtual SR lives where it always lived, in userland's EmulatedSR,
+ * accessed here with ufetch/ustore.  Guest memory access likewise: the
+ * u-access functions carry the fault handling that raw dereferences
+ * would not.
  *
- * See FASTPATH.md for the full design.
+ * See FASTPATH.md for the design; P0/P1 results at the bottom of it.
  */
 
 #include <sys/param.h>
@@ -23,25 +28,369 @@
 #include <sys/module.h>
 #include <sys/kmem.h>
 #include <sys/sysctl.h>
+#include <sys/lwp.h>
+#include <sys/proc.h>
 
 MODULE(MODULE_CLASS_MISC, bfast, NULL);
 
 #define BF_NVEC		256
 #define BF_TABBYTES	(BF_NVEC * sizeof(uint32_t))
-/*
- * The 68040 UM only requires the VBR to be longword aligned, but the
- * table has historically lived on a 1KB boundary (it is 1KB long and
- * sat at 0 on the 68000); align the copy the same way out of caution.
- */
 #define BF_TABALIGN	1024
 
-static void	*bf_alloc;		/* underlying allocation */
+#define BF_VEC_PRIV	8
+#define BF_VEC_ALINE	10
+
+static void	*bf_alloc;
 static size_t	bf_alloclen;
-static uint32_t	*bf_table;		/* aligned copy the VBR points at */
-static uint32_t	bf_orig_vbr;		/* what we found, restored on unload */
+static uint32_t	*bf_table;
+static uint32_t	bf_orig_vbr;
 static int	bf_swapped;
 
 static struct sysctllog *bf_clog;
+
+/*
+ * Shared with the stubs (asm) -- non-static, bf_ prefixed.
+ */
+struct pcb	*bf_pcb;		/* gate: registered lwp's pcb */
+uint32_t	bf_orig_priv;		/* stock vector 8 handler */
+uint32_t	bf_orig_aline;		/* stock vector 10 handler */
+uint32_t	bf_n_fast;		/* emulated at trap level */
+uint32_t	bf_n_defer;		/* ours, declined -> signal path */
+uint32_t	bf_n_aline;		/* ours, counted, chained (P3 pending) */
+uint32_t	bf_n_chain_priv;	/* not ours */
+uint32_t	bf_n_chain_aline;	/* not ours */
+
+/* Registered user addresses of Basilisk's virtual-SR state. */
+static uint32_t	bf_uaddr_emulsr;	/* uint16 EmulatedSR */
+static uint32_t	bf_uaddr_intflags;	/* uint32 InterruptFlags */
+
+void bf_stub_priv(void);
+void bf_stub_aline(void);
+int bf_ctrap_priv(uint32_t *r);
+
+/*
+ * Layout handed to bf_ctrap_priv: the stub pushes a pad longword, then
+ * moveml #0xffff -- so ascending memory holds d0-d7, a0-a6, the useless
+ * a7 slot, the pad, and then the hardware exception frame.
+ */
+#define BF_R_D(r, n)	((r)[(n)])
+#define BF_R_A(r, n)	((r)[8 + (n)])		/* a0..a6 only */
+struct bf_hwframe {
+	uint16_t	sr;
+	uint16_t	pc_hi;		/* split to dodge misalignment */
+	uint16_t	pc_lo;
+	uint16_t	fmtvec;
+} __packed;
+#define BF_FRAME(r)	((struct bf_hwframe *)((char *)(r) + 17 * 4))
+
+static inline uint32_t
+bf_frame_pc(const struct bf_hwframe *f)
+{
+	return ((uint32_t)f->pc_hi << 16) | f->pc_lo;
+}
+
+static inline void
+bf_frame_set_pc(struct bf_hwframe *f, uint32_t pc)
+{
+	f->pc_hi = pc >> 16;
+	f->pc_lo = pc & 0xffff;
+}
+
+static inline uint32_t
+bf_usp_read(void)
+{
+	uint32_t v;
+
+	__asm volatile("movl %%usp,%0" : "=a"(v));
+	return v;
+}
+
+static inline void
+bf_usp_write(uint32_t v)
+{
+	__asm volatile("movl %0,%%usp" : : "a"(v));
+}
+
+/*
+ * The stubs.  Gate in asm exactly as proven in P1; on a gate match,
+ * save everything and let C decide.  Chaining pushes the stock handler
+ * and returns to it with the frame untouched.
+ */
+__asm(
+"	.text\n"
+"	.even\n"
+"	.globl	bf_stub_priv\n"
+"bf_stub_priv:\n"
+"	btst	#5,%sp@\n"		/* from supervisor mode? */
+"	jne	2f\n"
+"	movl	%d0,%sp@-\n"
+"	movl	curpcb,%d0\n"
+"	cmpl	bf_pcb,%d0\n"
+"	jne	1f\n"
+"	movl	%sp@+,%d0\n"
+"	clrl	%sp@-\n"		/* pad, mirrors the stock handlers */
+"	moveml	#0xffff,%sp@-\n"	/* d0-d7/a0-a7 ascending */
+"	movl	%sp,%sp@-\n"		/* arg: register block */
+"	jbsr	bf_ctrap_priv\n"
+"	addql	#4,%sp\n"
+"	tstl	%d0\n"
+"	jeq	0f\n"
+"	moveml	%sp@+,#0x7fff\n"	/* d0-d7/a0-a6; NOT the a7 slot */
+"	addql	#8,%sp\n"		/* drop a7 slot + pad */
+"	rte\n"				/* handled: resume the guest */
+"0:	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
+"	movl	bf_orig_priv,%sp@-\n"
+"	rts\n"
+"1:	movl	%sp@+,%d0\n"
+"	addql	#1,bf_n_chain_priv\n"
+"2:	movl	bf_orig_priv,%sp@-\n"
+"	rts\n"
+"\n"
+"	.even\n"
+"	.globl	bf_stub_aline\n"
+"bf_stub_aline:\n"
+"	btst	#5,%sp@\n"
+"	jne	1f\n"
+"	movl	%d0,%sp@-\n"
+"	movl	curpcb,%d0\n"
+"	cmpl	bf_pcb,%d0\n"
+"	jne	0f\n"
+"	movl	%sp@+,%d0\n"
+"	addql	#1,bf_n_aline\n"	/* ours; P3 will handle it here */
+"	movl	bf_orig_aline,%sp@-\n"
+"	rts\n"
+"0:	movl	%sp@+,%d0\n"
+"	addql	#1,bf_n_chain_aline\n"
+"1:	movl	bf_orig_aline,%sp@-\n"
+"	rts\n"
+);
+
+/*
+ * Virtual SR plumbing, mirroring main_unix.cpp:
+ *   GET_SR       (frame ccr) | EmulatedSR
+ *   STORE_SR(v)  frame sr = v & 0x1f; EmulatedSR = v & 0xe700;
+ *                if mask cleared and interrupts pending -> TriggerInterrupt
+ * The trigger case is exactly what we DECLINE: userland must run it.
+ */
+static inline int
+bf_get_sr(const struct bf_hwframe *f, uint16_t *out)
+{
+	uint16_t emul;
+
+	if (ufetch_16((const uint16_t *)(uintptr_t)bf_uaddr_emulsr, &emul))
+		return -1;
+	*out = (f->sr & 0x1f) | emul;
+	return 0;
+}
+
+/* Returns 0 ok, -1 fault, 1 must-defer (interrupt trigger due). */
+static inline int
+bf_store_sr(struct bf_hwframe *f, uint16_t v)
+{
+	uint32_t flags;
+
+	if ((v & 0x0700) == 0) {
+		if (ufetch_32((const uint32_t *)(uintptr_t)bf_uaddr_intflags,
+		    &flags))
+			return -1;
+		if (flags != 0)
+			return 1;
+	}
+	if (ustore_16((uint16_t *)(uintptr_t)bf_uaddr_emulsr, v & 0xe700))
+		return -1;
+	f->sr = v & 0x1f;
+	return 0;
+}
+
+/*
+ * The emulation.  Return 1 = handled (registers/frame updated), 0 =
+ * decline with nothing mutated.  Every user access can fault; faults
+ * always decline.
+ */
+int
+bf_ctrap_priv(uint32_t *r)
+{
+	struct bf_hwframe *f = BF_FRAME(r);
+	uint32_t pc = bf_frame_pc(f);
+	uint32_t usp = bf_usp_read();
+	uint16_t op, ext, sr;
+	int st;
+
+	if (ufetch_16((const uint16_t *)pc, &op))
+		goto defer;
+
+	switch (op) {
+
+	case 0x40e7:				/* move sr,-(sp) */
+		if (bf_get_sr(f, &sr))
+			goto defer;
+		if (ustore_16((uint16_t *)(usp - 2), sr))
+			goto defer;
+		bf_usp_write(usp - 2);
+		bf_frame_set_pc(f, pc + 2);
+		break;
+
+	case 0x46df:				/* move (sp)+,sr */
+		if (ufetch_16((const uint16_t *)usp, &sr))
+			goto defer;
+		if ((st = bf_store_sr(f, sr)) != 0)
+			goto defer;
+		bf_usp_write(usp + 2);
+		bf_frame_set_pc(f, pc + 2);
+		break;
+
+	case 0x007c:				/* ori #xxxx,sr */
+		if (ufetch_16((const uint16_t *)(pc + 2), &ext))
+			goto defer;
+		if (bf_get_sr(f, &sr))
+			goto defer;
+		sr |= ext;
+		/* oring in bits cannot lower the mask: no trigger check */
+		if (ustore_16((uint16_t *)(uintptr_t)bf_uaddr_emulsr,
+		    sr & 0xe700))
+			goto defer;
+		f->sr = sr & 0x1f;
+		bf_frame_set_pc(f, pc + 4);
+		break;
+
+	case 0x027c:				/* andi #xxxx,sr */
+		if (ufetch_16((const uint16_t *)(pc + 2), &ext))
+			goto defer;
+		if (bf_get_sr(f, &sr))
+			goto defer;
+		if ((st = bf_store_sr(f, sr & ext)) != 0)
+			goto defer;
+		bf_frame_set_pc(f, pc + 4);
+		break;
+
+	case 0x46fc:				/* move #xxxx,sr */
+		if (ufetch_16((const uint16_t *)(pc + 2), &ext))
+			goto defer;
+		if ((st = bf_store_sr(f, ext)) != 0)
+			goto defer;
+		bf_frame_set_pc(f, pc + 4);
+		break;
+
+	case 0x46ef: {				/* move (d16,sp),sr */
+		int16_t d16;
+
+		if (ufetch_16((const uint16_t *)(pc + 2), &ext))
+			goto defer;
+		d16 = (int16_t)ext;
+		if (ufetch_16((const uint16_t *)(usp + d16), &sr))
+			goto defer;
+		if ((st = bf_store_sr(f, sr)) != 0)
+			goto defer;
+		bf_frame_set_pc(f, pc + 4);
+		break;
+	}
+
+	case 0x46d8: case 0x46d9: {		/* move (an)+,sr, n = 0,1 */
+		uint32_t an = BF_R_A(r, op & 7);
+
+		if (ufetch_16((const uint16_t *)an, &sr))
+			goto defer;
+		if ((st = bf_store_sr(f, sr)) != 0)
+			goto defer;
+		BF_R_A(r, op & 7) = an + 2;
+		bf_frame_set_pc(f, pc + 2);
+		break;
+	}
+
+	case 0x40f8: {				/* move sr,xxxx.w */
+		if (ufetch_16((const uint16_t *)(pc + 2), &ext))
+			goto defer;
+		if (bf_get_sr(f, &sr))
+			goto defer;
+		if (ustore_16((uint16_t *)(uintptr_t)ext, sr))
+			goto defer;
+		bf_frame_set_pc(f, pc + 4);
+		break;
+	}
+
+	case 0x40d0: case 0x40d1: case 0x40d2: case 0x40d3:
+	case 0x40d4: case 0x40d5: case 0x40d6: case 0x40d7: {
+						/* move sr,(an) */
+		uint32_t an = (op & 7) == 7 ? usp : BF_R_A(r, op & 7);
+
+		if (bf_get_sr(f, &sr))
+			goto defer;
+		if (ustore_16((uint16_t *)an, sr))
+			goto defer;
+		bf_frame_set_pc(f, pc + 2);
+		break;
+	}
+
+	case 0x40c0: case 0x40c1: case 0x40c2: case 0x40c3:
+	case 0x40c4: case 0x40c5: case 0x40c6: case 0x40c7:
+						/* move sr,dn */
+		if (bf_get_sr(f, &sr))
+			goto defer;
+		BF_R_D(r, op & 7) = (BF_R_D(r, op & 7) & 0xffff0000) | sr;
+		bf_frame_set_pc(f, pc + 2);
+		break;
+
+	case 0x46c0: case 0x46c1: case 0x46c2: case 0x46c3:
+	case 0x46c4: case 0x46c5: case 0x46c6: case 0x46c7:
+						/* move dn,sr */
+		if ((st = bf_store_sr(f, (uint16_t)BF_R_D(r, op & 7))) != 0)
+			goto defer;
+		bf_frame_set_pc(f, pc + 2);
+		break;
+
+	case 0xf327:				/* fsave -(sp) */
+		if (ustore_32((uint32_t *)(usp - 4), 0x41000000))
+			goto defer;
+		bf_usp_write(usp - 4);
+		bf_frame_set_pc(f, pc + 2);
+		break;
+
+	case 0xf35f:				/* frestore (sp)+ */
+		bf_usp_write(usp + 4);
+		bf_frame_set_pc(f, pc + 2);
+		break;
+
+	case 0xf478:				/* cpusha dc */
+	case 0xf4f8:				/* cpusha dc/ic */
+		__asm volatile(".word 0xf4f8");
+		bf_frame_set_pc(f, pc + 2);
+		break;
+
+	case 0x4e73: {				/* rte */
+		static const int frame_adj[16] = {
+			0, 0, 4, 4, 8, 0, 0, 52, 50, 12, 24, 84, 16, 0, 0, 0
+		};
+		uint32_t npc;
+		uint16_t nsr, fmt, pc_hi, pc_lo;
+
+		if (ufetch_16((const uint16_t *)usp, &nsr))
+			goto defer;
+		if (ufetch_16((const uint16_t *)(usp + 2), &pc_hi))
+			goto defer;
+		if (ufetch_16((const uint16_t *)(usp + 4), &pc_lo))
+			goto defer;
+		if (ufetch_16((const uint16_t *)(usp + 6), &fmt))
+			goto defer;
+		npc = ((uint32_t)pc_hi << 16) | pc_lo;
+		if ((st = bf_store_sr(f, nsr)) != 0)
+			goto defer;
+		bf_frame_set_pc(f, npc);
+		bf_usp_write(usp + 8 + frame_adj[fmt >> 12]);
+		break;
+	}
+
+	default:
+		goto defer;
+	}
+
+	bf_n_fast++;
+	return 1;
+
+defer:
+	bf_n_defer++;
+	return 0;
+}
 
 static inline uint32_t
 bf_vbr_read(void)
@@ -58,6 +407,40 @@ bf_vbr_write(uint32_t v)
 	__asm volatile("movc %0,%%vbr" : : "r"(v));
 }
 
+/*
+ * kern.bfast.attach: write nonzero to register the CALLING lwp; the
+ * sysctl runs in the writer's context, so curlwp is exactly the thread
+ * that takes the traps.  The uaddr sysctls must be set first; attach
+ * refuses without them.  Write zero to detach.
+ */
+static int
+bf_sysctl_attach(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	int t, error;
+
+	t = (bf_pcb != NULL);
+	node = *rnode;
+	node.sysctl_data = &t;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+
+	if (t) {
+		if (bf_uaddr_emulsr == 0 || bf_uaddr_intflags == 0)
+			return EINVAL;
+		if (bf_pcb != NULL && bf_pcb != lwp_getpcb(curlwp))
+			return EBUSY;
+		bf_pcb = lwp_getpcb(curlwp);
+		printf("bfast: attached pid %d (emulsr %08x intflags %08x)\n",
+		    curproc->p_pid, bf_uaddr_emulsr, bf_uaddr_intflags);
+	} else {
+		bf_pcb = NULL;
+		printf("bfast: detached\n");
+	}
+	return 0;
+}
+
 static int
 bfast_modcmd(modcmd_t cmd, void *aux)
 {
@@ -71,26 +454,14 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 		bf_table = (uint32_t *)roundup2((uintptr_t)bf_alloc,
 		    BF_TABALIGN);
 
-		/*
-		 * Copy the live table from wherever the VBR points now,
-		 * rather than from the vectab symbol: the running CPU's
-		 * routing is the truth we must preserve.
-		 */
 		bf_orig_vbr = bf_vbr_read();
 		memcpy(bf_table, (const void *)bf_orig_vbr, BF_TABBYTES);
+		bf_orig_priv = bf_table[BF_VEC_PRIV];
+		bf_orig_aline = bf_table[BF_VEC_ALINE];
+		bf_table[BF_VEC_PRIV] = (uint32_t)bf_stub_priv;
+		bf_table[BF_VEC_ALINE] = (uint32_t)bf_stub_aline;
 
-		/*
-		 * Push the copy out of the (copyback) data cache before
-		 * the CPU can fetch vectors through it.  Exception vector
-		 * fetches are data references on the 68040, so this is
-		 * strictly belt-and-braces, but it is one instruction.
-		 */
-		/*
-		 * cpusha %bc.  Raw opcode because the module build targets
-		 * the 68020 baseline and the assembler refuses the
-		 * mnemonic; this module is 68040-only regardless (the VBR
-		 * hook and the target machine both are).
-		 */
+		/* cpusha %bc as raw opcode; kmod builds target 68020. */
 		__asm volatile(".word 0xf4f8");
 
 		s = splhigh();
@@ -104,19 +475,62 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 		    NULL, 0, NULL, 0,
 		    CTL_KERN, CTL_CREATE, CTL_EOL);
 		if (node != NULL) {
+			const int n = node->sysctl_num;
+
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "attach",
+			    SYSCTL_DESCR("write 1 to register the calling "
+			        "lwp, 0 to detach"),
+			    bf_sysctl_attach, 0, NULL, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "uaddr_emulsr",
+			    SYSCTL_DESCR("user address of EmulatedSR"),
+			    NULL, 0, &bf_uaddr_emulsr, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "uaddr_intflags",
+			    SYSCTL_DESCR("user address of InterruptFlags"),
+			    NULL, 0, &bf_uaddr_intflags, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_INT, "swapped",
 			    SYSCTL_DESCR("VBR points at the module's table"),
 			    NULL, 0, &bf_swapped, 0,
-			    CTL_KERN, node->sysctl_num, CTL_CREATE, CTL_EOL);
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
-			    CTLFLAG_READONLY, CTLTYPE_INT, "vbr_orig",
-			    SYSCTL_DESCR("VBR as found at modload"),
-			    NULL, 0, &bf_orig_vbr, 0,
-			    CTL_KERN, node->sysctl_num, CTL_CREATE, CTL_EOL);
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_fast",
+			    SYSCTL_DESCR("traps emulated at trap level"),
+			    NULL, 0, &bf_n_fast, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_defer",
+			    SYSCTL_DESCR("ours, declined to the signal path"),
+			    NULL, 0, &bf_n_defer, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_aline",
+			    SYSCTL_DESCR("registered-process A-line traps "
+			        "(counted, chained until P3)"),
+			    NULL, 0, &bf_n_aline, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_chain_priv",
+			    SYSCTL_DESCR("other-source vector 8 traps"),
+			    NULL, 0, &bf_n_chain_priv, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_chain_aline",
+			    SYSCTL_DESCR("other-source vector 10 traps"),
+			    NULL, 0, &bf_n_chain_aline, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 		}
 
-		printf("bfast: phase 0, VBR %08x -> %08x (copy, unpatched)\n",
+		printf("bfast: phase 2, VBR %08x -> %08x, SR family "
+		    "fast-pathed, A-line count+chain\n",
 		    bf_orig_vbr, (uint32_t)bf_table);
 		return 0;
 
@@ -127,13 +541,16 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			bf_swapped = 0;
 			splx(s);
 		}
+		bf_pcb = NULL;
 		sysctl_teardown(&bf_clog);
 		if (bf_alloc != NULL) {
 			kmem_free(bf_alloc, bf_alloclen);
 			bf_alloc = NULL;
 			bf_table = NULL;
 		}
-		printf("bfast: unloaded, VBR restored to %08x\n", bf_orig_vbr);
+		printf("bfast: unloaded (fast %u defer %u aline %u "
+		    "chained %u/%u)\n", bf_n_fast, bf_n_defer, bf_n_aline,
+		    bf_n_chain_priv, bf_n_chain_aline);
 		return 0;
 
 	default:

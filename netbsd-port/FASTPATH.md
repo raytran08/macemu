@@ -141,3 +141,34 @@ correct and was verified by the machine surviving it.
 
 Build note: the module compiler targets the 68020 baseline, so 68040-only
 instructions (cpusha) must be emitted as raw opcodes (`.word 0xf4f8`).
+
+## P1 result (2026-08-22)
+
+Gate proven exact.  Over a boundary-aligned 100k-signal-trap window:
+kernel priv +54178 vs census other +53509 (1.25%), kernel aline +39744
+vs census 39229 (1.3%) -- both within the 2s sampling skew -- and both
+chain counters zero across the whole run.  The S-bit and curpcb tests
+classify every trap correctly under full load.
+
+## P2 result (2026-08-22)
+
+The SR family is emulated at trap level and the guest boots to the
+Finder on it.  Steady state: n_fast 529/s with a ~1% defer rate (the
+designed fallbacks: pending-interrupt mask lowering, unhandled opcodes).
+The A-line rate ROSE from ~260/s to 551/s -- the CPU freed by the fast
+path lets the guest generate work faster -- so total guest throughput is
+up ~1.6x while system time only fell 94% -> 86.6%: the A-line signal
+path absorbs all slack, exactly as the census predicted.  P3 is the
+payoff phase.
+
+Implementation notes that were not in the plan:
+- The stub hands a moveml-saved register block to a C handler at trap
+  level; C either emulates and the stub RTEs straight back to the guest,
+  or declines BEFORE MUTATING ANYTHING and the stub chains.  ufetch/
+  ustore carry the user-access fault handling.
+- moveml mask asymmetry: save with #0xffff (all-ones dodges the
+  predecrement bit-reversal), restore with #0x7fff so the stacked a7
+  slot never reaches the real SSP.
+- The virtual SR stays in userland (EmulatedSR/InterruptFlags, addresses
+  registered via kern.bfast.uaddr_*); the kernel reads InterruptFlags
+  locklessly, safe because TriggerInterrupt also raises SIGURG itself.

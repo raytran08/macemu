@@ -1068,6 +1068,32 @@ int main(int argc, char **argv)
 	D(bug("XPRAM thread started\n"));
 #endif
 
+#if defined(__NetBSD__) && defined(__m68k__)
+	/*
+	 * Register this thread with the bfast kernel module, if loaded.
+	 * From here on the module may fast-path our privilege-violation
+	 * and A-line traps at trap level instead of leaving them to the
+	 * signal path.  Must be done from THIS thread: the module gates
+	 * on the calling lwp's pcb, and this is the thread about to run
+	 * 68k code.  Absence of the module is not an error.
+	 */
+	{
+		extern uint16 EmulatedSR;
+		extern uint32 InterruptFlags;
+		int one = 1;
+		int a1 = (int)(uintptr_t)&EmulatedSR;
+		int a2 = (int)(uintptr_t)&InterruptFlags;
+
+		if (sysctlbyname("kern.bfast.uaddr_emulsr", NULL, NULL,
+		        &a1, sizeof(a1)) == 0 &&
+		    sysctlbyname("kern.bfast.uaddr_intflags", NULL, NULL,
+		        &a2, sizeof(a2)) == 0 &&
+		    sysctlbyname("kern.bfast.attach", NULL, NULL,
+		        &one, sizeof(one)) == 0)
+			printf("bfast: kernel fast path attached\n");
+	}
+#endif
+
 	// Start 68k and jump to ROM boot routine
 	D(bug("Starting emulation...\n"));
 	Start680x0();
@@ -1084,6 +1110,15 @@ int main(int argc, char **argv)
 void QuitEmulator(void)
 {
 	fprintf(stderr, "QuitEmulator called\n");
+
+#if defined(__NetBSD__) && defined(__m68k__)
+	// Detach from the bfast module; harmless if never attached.
+	{
+		int zero = 0;
+		sysctlbyname("kern.bfast.attach", NULL, NULL,
+		    &zero, sizeof(zero));
+	}
+#endif
 	D(bug("QuitEmulator\n"));
 
 #if EMULATED_68K
