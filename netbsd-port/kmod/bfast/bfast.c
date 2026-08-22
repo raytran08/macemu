@@ -40,6 +40,7 @@ MODULE(MODULE_CLASS_MISC, bfast, NULL);
 #define BF_VEC_PRIV	8
 #define BF_VEC_ALINE	10
 #define BF_VEC_TRACE	9
+#define BF_VEC_ILL	4
 
 static void	*bf_alloc;
 static size_t	bf_alloclen;
@@ -57,6 +58,7 @@ static pid_t	bf_pid;			/* who registered; re-checked in C */
 uint32_t	bf_orig_priv;		/* stock vector 8 handler */
 uint32_t	bf_orig_aline;		/* stock vector 10 handler */
 uint32_t	bf_orig_trace;		/* stock vector 9 handler */
+uint32_t	bf_orig_ill;		/* stock vector 4 handler */
 uint32_t	bf_n_fast;		/* emulated at trap level */
 uint32_t	bf_n_defer;		/* ours, declined -> signal path */
 uint32_t	bf_n_aline;		/* ours, counted, chained (P3 pending) */
@@ -94,6 +96,8 @@ void bf_stub_aline(void);
 int bf_ctrap_priv(uint32_t *r);
 int bf_ctrap_aline(uint32_t *r);
 int bf_ctrap_trace(uint32_t *r);
+void bf_clog_ill(uint32_t *r);
+static void bf_watch_check(uint32_t here);
 
 /*
  * Layout handed to bf_ctrap_priv: the stub pushes a pad longword, then
@@ -230,7 +234,32 @@ __asm(
 "1:	movl	%sp@+,%d0\n"
 "2:	movl	bf_orig_trace,%sp@-\n"
 "	rts\n"
+"\n"
+"	.even\n"
+"	.globl	bf_stub_ill\n"
+"bf_stub_ill:\n"
+"	btst	#5,%sp@\n"
+"	jne	1f\n"
+"	movl	%d0,%sp@-\n"
+"	movl	curpcb,%d0\n"
+"	cmpl	bf_pcb,%d0\n"
+"	jne	0f\n"
+"	movl	%sp@+,%d0\n"
+"	clrl	%sp@-\n"
+"	moveml	#0xffff,%sp@-\n"
+"	movl	%sp,%sp@-\n"
+"	jbsr	bf_clog_ill\n"
+"	addql	#4,%sp\n"
+"	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
+"	movl	bf_orig_ill,%sp@-\n"	/* ALWAYS chain: EMUL_OP is userland's */
+"	rts\n"
+"0:	movl	%sp@+,%d0\n"
+"1:	movl	bf_orig_ill,%sp@-\n"
+"	rts\n"
 );
+
+void bf_stub_ill(void);
 
 void bf_stub_trace(void);
 
@@ -295,6 +324,8 @@ bf_ctrap_priv(uint32_t *r)
 	uint32_t usp = bf_usp_read();
 	uint16_t op, ext, sr;
 	int st;
+
+	bf_watch_check(pc);
 
 	if (ufetch_16((const uint16_t *)pc, &op))
 		goto defer;
@@ -570,6 +601,66 @@ defer:
  */
 #define BF_MARK_WRITE	0xdeadbeefu
 
+/*
+ * Watchpoint, decoupled from tracing.
+ *
+ * Called from the privileged-op handler, which runs continuously for the
+ * whole boot, so it needs no T1 and covers the stretches single-stepping
+ * cannot reach.  Resolution is one privileged op rather than one
+ * instruction: the marker names the trap we were servicing when the
+ * change was noticed, which brackets the writer.
+ */
+static void
+bf_watch_check(uint32_t here)
+{
+	static uint32_t last;
+	static int valid;
+	uint32_t v;
+
+	if (bf_watch_addr == 0)
+		return;
+	if (ufetch_32((const uint32_t *)bf_watch_addr, &v) != 0)
+		return;
+	if (valid && v != last) {
+		struct bf_tr_ent *e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
+
+		e->pc = 0xdeadbeefu;
+		e->a2 = last;		/* old */
+		e->fp = v;		/* new */
+		e->usp = here;		/* trap pc when noticed */
+		bf_tr_n++;
+	}
+	last = v;
+	valid = 1;
+}
+
+/*
+ * Vector 4 logger.  EMUL_OP (0x71xx) decodes as an illegal instruction
+ * and MUST reach userland -- the device models live there -- so this
+ * handles nothing and always chains.  It exists only to keep the trace
+ * ring continuous across the stretches single-stepping cannot cover:
+ * T1 is in PSL_MBZ, so the signal path that services EMUL_OP necessarily
+ * strips it.  One ring entry per EMUL_OP, no behaviour change.
+ */
+void
+bf_clog_ill(uint32_t *r)
+{
+	struct bf_hwframe *f = BF_FRAME(r);
+	struct bf_tr_ent *e;
+
+	if (__predict_false(curproc->p_pid != bf_pid))
+		return;
+
+	bf_watch_check(bf_frame_pc(f));
+
+	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
+	e->pc = 0xe3110000u;	/* marker: EMUL_OP seen */
+	e->a2 = bf_frame_pc(f);
+	e->fp = BF_R_A(r, 6);
+	e->usp = bf_usp_read();
+	bf_tr_n++;
+}
+
 int
 bf_ctrap_trace(uint32_t *r)
 {
@@ -586,10 +677,16 @@ bf_ctrap_trace(uint32_t *r)
 	/*
 	 * Trace GUEST code only.  T1 otherwise survives into the emulator's
 	 * own text and libc -- one run's entire 32768-entry ring held
-	 * nothing but host addresses.  Guest RAM is 8MB from 0 with ROM
-	 * just above it, so anything at or past 0x00a00000 is not the guest.
+	 * nothing but host addresses.
+	 *
+	 * Guest code lives in TWO ranges, and forgetting the second cost
+	 * three runs: RAM from 0 with ROM above it (below 0x00a00000), and
+	 * the ROM's hardware alias at 0x40800000, which this ROM genuinely
+	 * executes from.  Gating on the low range alone silently ended every
+	 * window at the first `rtd` returning into 0x40826xxx.
 	 */
-	if (__predict_false(pc >= 0x00a00000)) {
+	if (__predict_false(pc >= 0x00a00000 &&
+	    (pc < 0x40800000 || pc >= 0x40900000))) {
 		f->sr &= 0x7fff;
 		bf_tracing = 0;
 		return 1;
@@ -607,9 +704,6 @@ bf_ctrap_trace(uint32_t *r)
 	 * Arm on the first pass and report every write afterwards, with
 	 * the writing pc -- that is the whole remaining question.
 	 */
-	if (__predict_false(pc == 0x40826620 && bf_watch_addr == 0))
-		bf_watch_addr = bf_usp_read();
-
 	if (bf_watch_addr != 0 &&
 	    ufetch_32((const uint32_t *)bf_watch_addr, &wv) == 0) {
 		if (watch_valid && wv != watch_last) {
@@ -721,9 +815,11 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 		bf_orig_priv = bf_table[BF_VEC_PRIV];
 		bf_orig_aline = bf_table[BF_VEC_ALINE];
 		bf_orig_trace = bf_table[BF_VEC_TRACE];
+		bf_orig_ill = bf_table[BF_VEC_ILL];
 		bf_table[BF_VEC_PRIV] = (uint32_t)bf_stub_priv;
 		bf_table[BF_VEC_ALINE] = (uint32_t)bf_stub_aline;
 		bf_table[BF_VEC_TRACE] = (uint32_t)bf_stub_trace;
+		bf_table[BF_VEC_ILL] = (uint32_t)bf_stub_ill;
 
 		/* cpusha %bc as raw opcode; kmod builds target 68020. */
 		__asm volatile(".word 0xf4f8");
@@ -800,8 +896,9 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    NULL, 0, &bf_trace_arm_pc, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
-			    CTLFLAG_READONLY, CTLTYPE_INT, "watch_addr",
-			    SYSCTL_DESCR("address the fatal rts pops"),
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "watch_addr",
+			    SYSCTL_DESCR("guest address to watch for writes"),
 			    NULL, 0, &bf_watch_addr, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,

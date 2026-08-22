@@ -316,6 +316,38 @@ to the stock handler, handling nothing.  That gives continuity across the
 untraceable stretches without changing behaviour, and costs one ring
 entry per EMUL_OP.
 
+Done, and it exposed a defect of my own making.  The vector-4 logger
+works (296 EMUL_OPs in a run), but three runs still ended at the same
+`rtd`, and the reason was the guest-code gate added two rounds earlier:
+it tested `pc >= 0x00a00000` and so classified the ROM's hardware alias
+at 0x40800000 -- which this ROM genuinely executes from, as the trap ring
+had been showing all along -- as "not the guest", switching tracing off
+at every return into 0x40826xxx.  Fixed to accept both ranges.
+
+With that fixed the trace finally reaches the fault, and confirms the
+chain end to end:
+
+    40826620  moveal %sp@+,%a0     usp=005fa198, a0 <- [005fa198]
+    40826622  jmp    %a0@          -> 00010f4a, 32 bytes into the hook
+    00010f4a  addql  #2,a7         the two-byte skew
+    00010f4c  rts                  pops the misaligned longword -> fault
+
+So the sole remaining question is unchanged but now precisely bounded:
+what writes 00010f4a into [005fa198]?
+
+The watchpoint was decoupled from tracing to answer it -- it now runs
+from the privileged-op handler and the EMUL_OP logger, needing no T1 and
+covering the whole boot.  It works, but it is a SAMPLING watchpoint: it
+sees the slot only when a trap happens to occur, and 005fa198 is ordinary
+reused stack, changing constantly.  The write of interest falls between
+samples and is never caught.
+
+Next technique, and it should be conclusive: mprotect the guest stack
+page read-only and let the existing SIGSEGV path report the faulting
+instruction directly.  That catches the exact writer with no sampling and
+no T1, at the cost of a signal per write to that page -- affordable if
+armed late, e.g. only once the boot has reached the point of interest.
+
 Two tracer improvements needed before the next round, both learnt here:
 - gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into
   the emulator's own code and libc, so a wrapped ring can be entirely
