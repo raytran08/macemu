@@ -1842,3 +1842,49 @@ NEW LATER FAILURE, now the frontier: SIGBUS (exit 138) in the probe's
 continuation, which addresses Quadra hardware registers (0xFFFFExxx)
 directly.  SIGBUS was added to the handled set on NetBSD/m68k but the
 postmortem does not fire for it yet -- investigate that first.
+
+
+## SYSTEM 7.5 BOOTS TO THE DESKTOP
+
+The last defect was a machine-identity mismatch, and it explains the
+whole class of failures chased above.
+
+Basilisk defaults to `modelid 5` -- Mac IIci (prefs_items.cpp:108) --
+while this port runs a **Quadra 650 ROM**.  System 7.5 asks the machine
+what it is, is told "IIci", and installs IIci-specific RAM patches whose
+jump targets are hard-coded IIci ROM addresses.  Run against a Quadra
+ROM those addresses are meaningless: the A815 handler's
+`jmp $408266b4` and the queue-walker call `jsr $40807ae0` both land in
+the wrong place -- the latter provably MID-INSTRUCTION (the real stream
+runs 40807ade -> 40807ae2, verified by decoding forwards from a known
+boundary and backwards from the rts).
+
+That accounts for every symptom: patches jumping into ROM internals that
+do not exist as entry points, identical failure across disks and images
+(same System version, same wrong patches), and different-but-still-broken
+behaviour with other ROMs (the IIci ROM matched the model but not the
+disk driver expectations).
+
+FIX: run with the model ID that matches the ROM.
+
+    ./BasiliskII --rom QUAD650.ROM --disk <image> \
+        --ramsize 8388608 --modelid 30 --screen dga
+
+30 is Gestalt 36 (gestaltQuadra650) minus the 6 the pref subtracts.
+
+RESULT: System 7.5 boots to the Finder and stays up -- desktop, menu
+bar, clock, "Macintosh HD" mounted with 19 items and 171.2MB free.
+
+MEASURED ON THE REAL WORKLOAD (System 7.5 at the desktop, not the Disk
+Tools floppy the earlier numbers used):
+
+    in-kernel traps      24,021/s
+    CPU                  25% user / 75% system
+    mis-chains           0 / 0
+    defers               4,664 (well under 1%)
+
+Still to do: the earlier SCSI_DISPATCH_D0 work and its resource patch
+remain in place and are harmless, but with a correct modelid the guest
+should no longer install the mismatched handler at all -- worth checking
+whether that patch still fires, and removing it if not.  The bfast attach
+EBUSY-after-crash issue also still wants a pid-liveness check.

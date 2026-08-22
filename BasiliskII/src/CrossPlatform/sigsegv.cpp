@@ -314,6 +314,14 @@ static void powerpc_decode_instruction(instruction_t *instruction, unsigned int 
 #define SIGSEGV_CONTEXT_REGS			(((ucontext_t *)scp)->uc_mcontext.__gregs)
 #define SIGSEGV_FAULT_INSTRUCTION		SIGSEGV_CONTEXT_REGS[_REG_PC]
 #define SIGSEGV_REGISTER_FILE			(SIGSEGV_REGISTER_TYPE *)SIGSEGV_CONTEXT_REGS
+/*
+ * On m68k an unmapped access raises SIGBUS, not SIGSEGV: the 68040 takes
+ * a bus error and NetBSD reports it as such.  Without this the fault
+ * handler never runs for the most common guest fault on this port, and
+ * the process dies with no diagnostics at all.
+ */
+#undef SIGSEGV_ALL_SIGNALS
+#define SIGSEGV_ALL_SIGNALS				FAULT_HANDLER(SIGSEGV) FAULT_HANDLER(SIGBUS)
 #elif (defined(i386) || defined(__i386__))
 #include <sys/ucontext.h>
 #define SIGSEGV_CONTEXT_REGS			(((ucontext_t *)scp)->uc_mcontext.__gregs)
@@ -417,7 +425,7 @@ static inline sigsegv_address_t get_fault_instruction(const ucontext_t *ucp)
 #if HAVE_SIGCONTEXT_SUBTERFUGE
 // Linux kernels prior to 2.4 ?
 #if defined(__linux__)
-#define SIGSEGV_ALL_SIGNALS				FAULT_HANDLER(SIGSEGV) FAULT_HANDLER(SIGBUS)
+#define SIGSEGV_ALL_SIGNALS				FAULT_HANDLER(SIGSEGV)
 #if (defined(i386) || defined(__i386__))
 #include <asm/sigcontext.h>
 #define SIGSEGV_FAULT_HANDLER_ARGLIST	int sig, struct sigcontext scs
