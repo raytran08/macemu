@@ -172,3 +172,25 @@ Implementation notes that were not in the plan:
 - The virtual SR stays in userland (EmulatedSR/InterruptFlags, addresses
   registered via kern.bfast.uaddr_*); the kernel reads InterruptFlags
   locklessly, safe because TriggerInterrupt also raises SIGURG itself.
+
+## P3 result (2026-08-22)
+
+A-line reflection works and delivers the payoff.  The guest boots to the
+Finder with both trap classes handled at trap level:
+
+                    signals only   P2 (SR only)   P3 (SR + A-line)
+  trap throughput       733/s        ~1100/s         34,718/s
+  CPU user/system       6%/94%       12%/87%         25%/75%
+
+47x the trap throughput of the signal path.  The remaining system time
+is the fast path doing real work (34,718 x ~20us =~ 70%), not delivery
+overhead.  Signal-path traffic is down to EMUL_OP plus a <1% defer rate
+(619 defers against ~10^6 fast traps at measurement time); the userland
+census, which now sees only signal-delivered traps, had not reached its
+first 100k dump when this was recorded -- it used to reach it in under
+three minutes.
+
+The guest's Toolbox dispatcher runs entirely via kernel reflection: push
+{SR, PC, $0028} on the guest stack, vector through guest 0x28, and the
+dispatcher's terminating RTE lands in the vector-8 handler that P2
+proved.  The emulator process is not woken at all for either class.

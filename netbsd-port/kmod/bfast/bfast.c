@@ -67,6 +67,7 @@ static uint32_t	bf_uaddr_intflags;	/* uint32 InterruptFlags */
 void bf_stub_priv(void);
 void bf_stub_aline(void);
 int bf_ctrap_priv(uint32_t *r);
+int bf_ctrap_aline(uint32_t *r);
 
 /*
  * Layout handed to bf_ctrap_priv: the stub pushes a pad longword, then
@@ -151,18 +152,29 @@ __asm(
 "	.globl	bf_stub_aline\n"
 "bf_stub_aline:\n"
 "	btst	#5,%sp@\n"
-"	jne	1f\n"
+"	jne	2f\n"
 "	movl	%d0,%sp@-\n"
 "	movl	curpcb,%d0\n"
 "	cmpl	bf_pcb,%d0\n"
-"	jne	0f\n"
+"	jne	1f\n"
 "	movl	%sp@+,%d0\n"
-"	addql	#1,bf_n_aline\n"	/* ours; P3 will handle it here */
+"	clrl	%sp@-\n"
+"	moveml	#0xffff,%sp@-\n"
+"	movl	%sp,%sp@-\n"
+"	jbsr	bf_ctrap_aline\n"
+"	addql	#4,%sp\n"
+"	tstl	%d0\n"
+"	jeq	0f\n"
+"	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
+"	rte\n"
+"0:	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
 "	movl	bf_orig_aline,%sp@-\n"
 "	rts\n"
-"0:	movl	%sp@+,%d0\n"
+"1:	movl	%sp@+,%d0\n"
 "	addql	#1,bf_n_chain_aline\n"
-"1:	movl	bf_orig_aline,%sp@-\n"
+"2:	movl	bf_orig_aline,%sp@-\n"
 "	rts\n"
 );
 
@@ -392,6 +404,47 @@ defer:
 	return 0;
 }
 
+/*
+ * A-line reflection: hand the trap to the guest's own dispatcher without
+ * waking the emulator at all.  Byte-for-byte the frame main_unix.cpp
+ * pushes -- vector offset $28, the PC of the A-line instruction, the
+ * synthetic SR -- and the new PC comes from the guest vector table at
+ * user address 0x28 (guest page zero is mapped; vm.user_va0_disable=0).
+ * The guest dispatcher's terminating RTE lands in bf_ctrap_priv, which
+ * pops this exact frame.  Neither EmulatedSR nor the real frame SR
+ * changes: userland's A-line path never touched them either.
+ */
+int
+bf_ctrap_aline(uint32_t *r)
+{
+	struct bf_hwframe *f = BF_FRAME(r);
+	uint32_t pc = bf_frame_pc(f);
+	uint32_t usp = bf_usp_read();
+	uint32_t npc;
+	uint16_t sr;
+
+	if (bf_get_sr(f, &sr))
+		goto defer;
+	if (ufetch_32((const uint32_t *)0x28, &npc))
+		goto defer;
+	if (ustore_16((uint16_t *)(usp - 2), 0x28))
+		goto defer;
+	if (ustore_32((uint32_t *)(usp - 6), pc))
+		goto defer;
+	if (ustore_16((uint16_t *)(usp - 8), sr))
+		goto defer;
+	bf_usp_write(usp - 8);
+	bf_frame_set_pc(f, npc);
+
+	bf_n_aline++;
+	bf_n_fast++;
+	return 1;
+
+defer:
+	bf_n_defer++;
+	return 0;
+}
+
 static inline uint32_t
 bf_vbr_read(void)
 {
@@ -513,8 +566,7 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_INT, "n_aline",
-			    SYSCTL_DESCR("registered-process A-line traps "
-			        "(counted, chained until P3)"),
+			    SYSCTL_DESCR("A-line traps reflected to the guest"),
 			    NULL, 0, &bf_n_aline, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
@@ -529,8 +581,8 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 		}
 
-		printf("bfast: phase 2, VBR %08x -> %08x, SR family "
-		    "fast-pathed, A-line count+chain\n",
+		printf("bfast: phase 3, VBR %08x -> %08x, SR family "
+		    "fast-pathed, A-line reflected\n",
 		    bf_orig_vbr, (uint32_t)bf_table);
 		return 0;
 
