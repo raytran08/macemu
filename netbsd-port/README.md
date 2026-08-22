@@ -342,11 +342,42 @@ sees the slot only when a trap happens to occur, and 005fa198 is ordinary
 reused stack, changing constantly.  The write of interest falls between
 samples and is never caught.
 
-Next technique, and it should be conclusive: mprotect the guest stack
-page read-only and let the existing SIGSEGV path report the faulting
-instruction directly.  That catches the exact writer with no sampling and
-no T1, at the cost of a signal per write to that page -- affordable if
-armed late, e.g. only once the boot has reached the point of interest.
+Not needed: putting the watchpoint back INSIDE the trace handler (as well
+as at trap time) gives per-instruction resolution inside a traced window,
+and with the alias gate fixed the window now reaches the fault.
+
+One more of my own errors first, worth recording because it wasted a run:
+the slot is [005fa194], not [005fa198].  `moveal %sp@+,%a0` is at
+4082661e; 40826620 is the `addqw #4,%sp` AFTER it.  The trace states it
+plainly -- usp=005fa194 at 4082661e, 005fa198 at 40826620 -- and I read
+the disassembly one instruction out.
+
+WITH THE RIGHT SLOT, THE WRITER IS CAUGHT:
+
+    3066368  pc=40826e88   (last traced guest instruction)
+    3066369  WATCH 005fa194: 31300000 -> 00010f4a
+
+and 40826e88 is the loop back-edge of
+
+    40826e72:  ...
+    40826e86:  movel %d0,%a0@+
+    40826e88:  dbf   %d1,0x40826e72
+
+a longword FILL LOOP writing through a0 with a dbf counter in d1.  It is
+storing into 005fa194, which is stack.  Immediately after it comes a
+second fill loop (movel %d7,%a0@+, count 255-d4 at 40826e94), so this is
+ROM initialising a table through a0 -- and a0 is pointing at, or has run
+into, the guest stack.
+
+That is the corruption event, and everything downstream is mechanical:
+the filled longword is later popped as a0 by the resume tail, the jmp
+lands 32 bytes into the RAM hook, addql #2,a7 skews the stack, and the
+rts pops a misaligned longword into the PC.
+
+Next, and it is a small step: log a0/d0/d1 at 40826e86 to see the fill's
+base and count, then work back to what set them -- the likely culprit is
+an earlier EMUL_OP-serviced query returning a wrong size or pointer,
+since ROM code filling its own table would not otherwise reach 0x5fa194.
 
 Two tracer improvements needed before the next round, both learnt here:
 - gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into

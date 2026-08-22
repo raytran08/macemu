@@ -721,6 +721,14 @@ bf_ctrap_trace(uint32_t *r)
 		watch_valid = 1;
 	}
 
+	/*
+	 * Per-instruction watch resolution while stepping.  The trap-time
+	 * sampling in bf_ctrap_priv covers the whole boot but only sees the
+	 * slot when a trap happens; inside a traced window this sees every
+	 * single write, which is what is needed to name the writer.
+	 */
+	bf_watch_check(pc);
+
 	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
 	e->pc = pc;
 	e->a2 = BF_R_A(r, 2);
