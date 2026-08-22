@@ -1733,6 +1733,18 @@ bf_dump_ring(void)
 			fprintf(stderr, "  %08x: %04x %04x %04x %04x\n", a,
 			    ReadMacInt16(a), ReadMacInt16(a + 2),
 			    ReadMacInt16(a + 4), ReadMacInt16(a + 6));
+
+		/*
+		 * The A815 handler.  The dispatcher resolves _SCSIDispatch
+		 * to 0x0000f100 -- a RAM patch, not Basilisk's ROM
+		 * replacement -- which is why selector 4 never reaches our
+		 * emulation.  This is the code that services it.
+		 */
+		fprintf(stderr, "A815 handler 0x0000f100..0x0000f180:\n");
+		for (a = 0x0000f100; a < 0x0000f180; a += 8)
+			fprintf(stderr, "  %08x: %04x %04x %04x %04x\n", a,
+			    ReadMacInt16(a), ReadMacInt16(a + 2),
+			    ReadMacInt16(a + 4), ReadMacInt16(a + 6));
 	}
 
 	/*

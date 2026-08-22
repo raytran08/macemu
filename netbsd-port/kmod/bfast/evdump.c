@@ -13,7 +13,13 @@ int main(void) {
 	lo = n > 256 ? n - 256 : 0;
 	for (k = lo; k < n; k++) {
 		struct e *p = &v[k & 255];
-		printf("%4d pc=%08x sp=%08x depth=%u\n", k, p->pc, p->sp, p->aln);
+		{
+			const char *tag = "";
+			if (p->pc == 0x008099b8) tag = "  <- dispatcher entry, a0=trapping pc";
+			else if (p->pc == 0x008099d6) tag = "  <- dispatcher rts, a0=HANDLER";
+			printf("%4d pc=%08x sp=%08x a0=%08x depth=%u%s\n",
+			    k, p->pc, p->sp, p->a0, p->aln, tag);
+		}
 		{ int i; for (i = 0; i < 4 && p->f[i]; i++)
 			printf("            frame[-%d] from %08x at sp %08x  guestSR=%04x%s\n",
 			    i, p->f[i], p->fsp[i], p->fsr[i] & 0xffff,

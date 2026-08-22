@@ -683,13 +683,31 @@ a815 at 00010f48 must have consumed its 14 bytes of parameters and left a
 2-byte result.  The rts instead pops rubbish, so the stack after that
 trap is not what the hook expects.
 
-And we already know something odd about that exact trap: selector 4 never
-reaches Basilisk's _SCSIDispatch replacement, though the a815 certainly
-traps and certainly carries selector 4.  Something else is servicing it
-and not cleaning up the way the caller requires.  Finding what handles
-A815 selector 4 on this system is the next concrete step, and the
-dispatcher instrumentation already in bfast (008099c6 logs the resolved
-table entry) can answer it directly.  That is guest/ROM-patch territory rather than emulator
+ANSWERED: A815 IS PATCHED INTO RAM.  The dispatcher instrumentation shows
+the resolution directly --
+
+    891  008099b8  a0=00010f48   dispatcher entry (the hook's 2nd a815)
+    892  008099c6  ...           Toolbox table read
+    893  008099d6  a0=0000f100   dispatcher rts -> HANDLER
+
+_SCSIDispatch resolves to **0x0000f100**, a RAM address, not Basilisk's
+replacement in ROM at 0x008xxxxx.  That is why selector 4 never reaches
+our emulation: the trap has been re-patched, presumably by the System
+file during startup, to a RAM routine -- and the instruction trace
+confirms that routine executing (0000f100, f102, f104, f106 appear in the
+ring).
+
+For contrast, the surrounding Toolbox traps resolve normally to ROM:
+40826f92 and 40826f9e both resolve to 0081c490, and 408270b0/b4 to
+0081c312.  Only A815 goes to RAM.
+
+So the picture is coherent for the first time: the guest patches
+_SCSIDispatch into RAM, that RAM patch services selector 4, and the stack
+it leaves is not what the caller at 00010f4a expects.  Whether the patch
+is at fault, or whether it is a correct patch defeated by something our
+SCSI emulation does or fails to do beneath it, is the remaining question
+-- and it is now a question about a specific, identified, 128-byte piece
+of code.  That is guest/ROM-patch territory rather than emulator
 territory -- which is consistent with everything else that has been
 cleared here, and means the next work is understanding what that resume
 path is FOR (which trap it is entitled to resume, and how it is supposed
