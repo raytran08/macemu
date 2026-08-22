@@ -102,6 +102,13 @@ using std::string;
 #include "macos_util.h"
 #include "adb.h"
 
+/*
+ * Where the Quadra ROM is aliased, matching the mapping made in main().
+ * The ROM holds absolute references to its hardware address, so the guest
+ * executes from here as well as from ROMBaseMac.
+ */
+#define ROM_ALIAS_BASE 0x40800000u
+
 /* BII_TRACE_REARM=1: keep kernel tracing alive across signal handlers.
    Off by default: self-sustaining tracing wraps the ring thousands of
    times and destroys any record of early boot. */
@@ -1647,6 +1654,35 @@ static void *tick_func(void *arg)
 unsigned long bf_t1_stripped;	/* T1 bits scrubbed before setcontext */
 
 /*
+ * Interrupt-in-critical-section census.
+ *
+ * 0x40807ac0..0x40807b06 is a ROM linked-list walker that runs with
+ * interrupts masked and ends `move (sp)+,sr; rts`.  On hardware a
+ * pending interrupt is taken at the instruction boundary AFTER the mask
+ * drops; here the mask drop is an emulated trap that can deliver a faked
+ * frame mid-return.  Count deliveries that land inside it.
+ */
+#define CS_LO 0x40807ac0u
+#define CS_HI 0x40807b06u
+static unsigned long cs_hits, cs_total, cs_alias;
+static unsigned long cs_defer_alias, cs_defer_host;
+static uint32 cs_last[8];
+static int cs_last_n;
+
+void cs_dump(void);
+void cs_dump(void)
+{
+	int i;
+
+	fprintf(stderr, "interrupt deliveries: %lu total, %lu in aliased ROM, "
+	    "%lu inside the critical section\n", cs_total, cs_alias, cs_hits);
+	fprintf(stderr, "deferrals: %lu aliased-ROM (should now be 0), "
+	    "%lu host code\n", cs_defer_alias, cs_defer_host);
+	for (i = 0; i < cs_last_n; i++)
+		fprintf(stderr, "  delivered at pc=%08x\n", cs_last[i]);
+}
+
+/*
  * Stack-delta audit for the USERLAND path.
  *
  * bfast audits the fast path in the kernel and found it correct, but the
@@ -1772,6 +1808,8 @@ bf_dump_ring(void)
 
 	{
 		extern void ud_dump(void);
+		extern void cs_dump(void);
+		cs_dump();
 		ud_dump();
 	}
 
@@ -2000,7 +2038,21 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	 */
 	static unsigned long irq_deferred, irq_delivered;
 
-	if ((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) {
+	/*
+	 * Guest code lives in TWO ranges, and the second was missing here.
+	 * RAM from 0 with ROM above it, AND the ROM's hardware alias at
+	 * 0x40800000, which this ROM genuinely executes from -- every trap
+	 * ring in netbsd-port/README.md is full of 0x40826xxx addresses.
+	 *
+	 * Testing only the low range deferred EVERY interrupt that arrived
+	 * while the guest was running aliased ROM, which is most of them:
+	 * the logs show deferred counts running level with delivered.  The
+	 * guest was being starved of ticks for long stretches and then
+	 * handed a backlog on the way back down to low addresses.
+	 */
+	if (((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) &&
+	    !((uint32)sc_pc >= ROM_ALIAS_BASE &&
+	      (uint32)sc_pc <  ROM_ALIAS_BASE + ROM_MAX_SIZE)) {
 		/*
 		 * Not in guest code, so a frame built here would capture a
 		 * host pc.  Leave the interrupt PENDING rather than losing
@@ -2008,6 +2060,11 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 		 * re-triggers on the way back out of native code.
 		 */
 		irq_deferred++;
+		if ((uint32)sc_pc >= ROM_ALIAS_BASE &&
+		    (uint32)sc_pc < ROM_ALIAS_BASE + ROM_MAX_SIZE)
+			cs_defer_alias++;
+		else
+			cs_defer_host++;
 		if ((irq_deferred % 200) == 1)
 			fprintf(stderr, "irq: deferred=%lu delivered=%lu\n",
 			    irq_deferred, irq_delivered);
@@ -2031,6 +2088,16 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 
 	// Set interrupt level
 	EmulatedSR |= 0x2100;
+
+	cs_total++;
+	if ((uint32)sc_pc >= ROM_ALIAS_BASE &&
+	    (uint32)sc_pc < ROM_ALIAS_BASE + ROM_MAX_SIZE)
+		cs_alias++;
+	if ((uint32)sc_pc >= CS_LO && (uint32)sc_pc <= CS_HI) {
+		cs_hits++;
+		if (cs_last_n < 8)
+			cs_last[cs_last_n++] = (uint32)sc_pc;
+	}
 
 	/* Mark delivery so a2/a3 can be compared across the interrupt. */
 	bf_ring_add((uint32)sc_pc, (uint32)sc_sp, (uint32)gr[_REG_A0 + 2],

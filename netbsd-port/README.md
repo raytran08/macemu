@@ -887,9 +887,28 @@ This is precisely the fragility upstream warns about ("manually call the
 Mac 68k interrupt handler with a faked stack frame"), located at a
 specific instruction for the first time.
 
-HOW TO TEST IT, cheaply and without a hack: log every interrupt delivery
-whose interrupted pc lies inside 0x40807ac0-0x40807b06, and see whether
-the crash correlates.  bfast already records interrupt deliveries and the
+TESTED, AND FALSIFIED.  Counting interrupt deliveries by interrupted pc:
+
+    deliveries: 150 total, 0 in aliased ROM, 0 in the critical section
+    deferrals:  0 aliased-ROM, 594 host code
+
+No interrupt is EVER delivered inside that critical section, so it cannot
+be the mechanism.  The hypothesis is dead.
+
+The investigation did turn up a real -- but latent -- bug on the way.  The
+deferral guard in sigirq_handler tested only `pc >= RAMSize +
+ROM_MAX_SIZE`, which treats the ROM's alias at 0x40800000 as non-guest
+and would defer any interrupt arriving while the guest ran aliased ROM.
+That is the same mistake made in the kernel tracer's guest-code gate
+earlier, and it is now fixed (ROM_ALIAS_BASE).  Measured after the fix:
+zero aliased-ROM deferrals -- but also zero aliased-ROM DELIVERIES, so
+the situation never actually arises.  The guest is not executing aliased
+ROM at the moments signals land.  The fix is correct and worth keeping;
+it changes nothing observable.
+
+Original plan, left for the record:
+log every interrupt delivery whose interrupted pc lies inside
+0x40807ac0-0x40807b06, and see whether the crash correlates.  bfast already records interrupt deliveries and the
 userland ring already marks them; this needs only a pc-range filter.  If
 the correlation holds, the fix is to defer delivery until the guest has
 left the critical section rather than injecting mid-return -- which is a
