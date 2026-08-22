@@ -127,3 +127,17 @@ Known-unknowns to watch at P3: guest RTEs of non-zero-format frames
 as userland today); interaction with genuine page faults on guest stack
 pushes mid-stub (PCB_ONFAULT covers the access, chain on fault, the
 signal path then repeats the work with full fault handling).
+
+## P0 result (2026-08-22)
+
+Proven on the machine.  Two modload/modunload cycles while Basilisk II
+ran at full trap load: `kern.bfast.swapped=1` after each load, 100k+
+guest traps flowed through the copied table between load and unload
+(histogram 700000 -> 800000), the sysctl tree came and went cleanly, and
+machine and guest stayed healthy throughout.  One detail worth keeping:
+the kernel runs with VBR=0 -- the live table sits at virtual address
+zero -- so `vbr_orig` reads 0 and the restore is a movec of 0, which is
+correct and was verified by the machine surviving it.
+
+Build note: the module compiler targets the 68020 baseline, so 68040-only
+instructions (cpusha) must be emitted as raw opcodes (`.word 0xf4f8`).
