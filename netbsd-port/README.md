@@ -72,11 +72,36 @@ Eliminated so far, each by direct test rather than argument:
   SR word, and the restore is moveml sp@+,d0-d7/a0-a6, skip the stale a7
   slot, rtr.  Consistent, no scrambling.
 
-The remaining suspect is the guest's Toolbox trap dispatch table -- what
-A868 resolves to, and whether it points at the ROM alias that matches
-where execution actually is.  Reading that table from the guest's low
-memory is the next instrument, and it needs Mac OS internals rather than
-more emulator instrumentation.
+The Toolbox dispatch table is NOT the problem, and neither is the ROM
+alias.  Disassembling the guest's own A-line handler at 0x008099b0 gives
+the table addresses directly --
+
+    8099e0:  movel @(0x0e00,%d2:w:4),%sp@(8)   Toolbox: 0x0E00 + trap*4
+    809a04:  jsr   @(0x0400,%d2:w:4)@(0)       OS:      0x0400 + trap*4
+
+-- and dumping them at the fault shows the table intact: A868 resolves to
+0x0081c312, A869 to 0x0081c490, A9A0 to 0x0081b5A0, and a scan of all
+1024 Toolbox entries reports **zero** suspect values.  The handler it
+points at is ordinary 68020+ ROM code (mulsl, bfexts), all valid on a
+68040 and none of it trapping.
+
+What the trap ring actually shows, read properly, is an interrupt:
+
+    pc=0080a29a op=7129   EMUL_OP -- and 0x7129 is M68K_EMUL_OP_IRQ
+    pc=0080a2a8 op=46fc   move #x,sr    interrupt epilogue
+    pc=00809b88 op=4e73   rte           return from interrupt
+
+So a 60Hz interrupt is delivered in the middle of the Fixed-math
+sequence, and after it returns the code proceeds with a2/a3 holding
+fixed-point values where it expects pointers.  That fits everything: the
+timing dependence, the ~18000-trap delay, and the absence of the fault on
+the idle Disk Tools workload.  It is also a bug class this port has hit
+before -- see commit 6df9880d, "Fix the 60Hz interrupt corrupting
+non-guest context".
+
+Next instrument, in order of cheapness: record a2/a3 in the trap ring so
+their values can be seen across the interrupt boundary; then compare the
+frame sigirq_handler pushes against what the guest's RTE pops.
 
 Instrumentation for this is in main_unix.cpp behind the SIGSEGV dump: a
 24-entry ring of (pc, opcode, a7) filled on every signal-path trap, the

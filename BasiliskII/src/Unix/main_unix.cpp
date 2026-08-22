@@ -1656,6 +1656,48 @@ bf_dump_ring(void)
 #endif
 
 	/*
+	 * The guest's trap dispatch tables.
+	 *
+	 * Addresses come from disassembling the ROM's own A-line handler at
+	 * 0x008099b0: the Toolbox path is
+	 *     movel @(0x0e00,%d2:w:4),%sp@(8)
+	 * and the OS path is
+	 *     jsr @(0x0400,%d2:w:4)@(0)
+	 * so Toolbox entries live at 0x0E00 + trap*4 and OS entries at
+	 * 0x0400 + trap*4.  If the entry for the trap we died on holds the
+	 * bad value, the table is the fault; if it holds a sane ROM address,
+	 * the dispatch was fine and the damage is further in.
+	 */
+	{
+		static const uint16 interesting[] = { 0xa868, 0xa869, 0xa9a0 };
+		unsigned t, bad = 0;
+
+		for (t = 0; t < sizeof(interesting)/sizeof(interesting[0]); t++) {
+			uint16 tr = interesting[t];
+			uint32 idx = tr & 0x03ff;
+			uint32 ent = 0x0e00 + idx * 4;
+
+			fprintf(stderr, "toolbox trap %04x -> [%04x] = %08x\n",
+			    tr, (unsigned)ent, ReadMacInt32(ent));
+		}
+		fprintf(stderr, "scanning the toolbox table for non-code "
+		    "entries:\n");
+		for (t = 0; t < 1024; t++) {
+			uint32 v = ReadMacInt32(0x0e00 + t * 4);
+
+			if (v == 0 || v >= 0x10000000 ||
+			    (v >= 0x00900000 && v < 0x40800000)) {
+				if (bad++ < 12)
+					fprintf(stderr, "  [%04x] trap a%03x "
+					    "= %08x\n",
+					    (unsigned)(0x0e00 + t * 4),
+					    (unsigned)(0x800 + t), v);
+			}
+		}
+		fprintf(stderr, "  %u suspect entries of 1024\n", bad);
+	}
+
+	/*
 	 * Guest stack at the fault.  The wild jump left a return address
 	 * behind if it was a jsr/bsr, and the dispatcher's frame is here
 	 * too; anything in ROM (0x40800000/0x00800000 alias) or low RAM is
