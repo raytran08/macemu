@@ -109,6 +109,17 @@ using std::string;
  */
 #define ROM_ALIAS_BASE 0x40800000u
 
+/*
+ * cpusha is privileged, so it is only serviceable once the SIGILL
+ * handler (or bfast) is in place.  FlushCodeCache runs during ROM and
+ * resource patching, long before that, and executing it there kills the
+ * process with SIGILL before any output appears.  Set true just before
+ * the guest starts.
+ */
+static bool native_traps_ready = false;
+/* BII_NO_FLUSHALL=1 disables the whole-cache shortcut, for A/B testing. */
+static bool flush_all_ok = true;
+
 /* BII_TRACE_REARM=1: keep kernel tracing alive across signal handlers.
    Off by default: self-sustaining tracing wraps the ring thousands of
    times and destroys any record of early boot. */
@@ -1216,6 +1227,12 @@ int main(int argc, char **argv)
 	}
 #endif
 
+	if (getenv("BII_NO_FLUSHALL") != NULL) {
+		flush_all_ok = false;
+		fprintf(stderr, "whole-cache flush shortcut DISABLED\n");
+	}
+	native_traps_ready = true;	/* cpusha is serviceable from here on */
+
 	// Start 68k and jump to ROM boot routine
 	D(bug("Starting emulation...\n"));
 	Start680x0();
@@ -1338,8 +1355,39 @@ void QuitEmulator(void)
  *  or a dynamically recompiling emulator)
  */
 
+/*
+ * Threshold above which flushing the WHOLE cache beats flushing a range.
+ *
+ * m68k_sync_icache walks the range a cache line at a time, so a large
+ * BlockMove costs thousands of cpushl.  Measured: BLOCK_MOVE EMUL_OPs
+ * run ~114/s at an idle System 7.5 desktop with a round trip of ~1.9ms
+ * each -- about a quarter of the machine spent flushing caches line by
+ * line.  A single `cpusha bc` does the lot; it is privileged, so it
+ * traps and bfast services it in ~14us.
+ *
+ * 8KB is a little over the 68040's 4KB+4KB caches, so beyond that a
+ * whole-cache flush is discarding no more than a range flush would.
+ */
+#define FLUSH_ALL_THRESHOLD 8192
+
+/*
+ * cpusha is privileged, so it only works once the SIGILL handler (or
+ * bfast) is in place to service it.  FlushCodeCache is called during ROM
+ * and resource patching, long before that -- doing it there kills the
+ * process with SIGILL before a single line of output.  Set true just
+ * before the guest starts.
+ */
+
+
 void FlushCodeCache(void *start, uint32 size)
 {
+#if !EMULATED_68K && defined(__NetBSD__) && defined(__m68k__)
+	if (flush_all_ok && native_traps_ready && size >= FLUSH_ALL_THRESHOLD) {
+		/* cpusha bc, as a raw opcode: userland assembles for 68020 */
+		__asm volatile(".word 0xf4f8");
+		return;
+	}
+#endif
 #if USE_JIT
     if (UseJIT)
 #ifdef UPDATE_UAE

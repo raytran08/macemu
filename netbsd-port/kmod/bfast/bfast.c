@@ -64,6 +64,11 @@ uint32_t	bf_n_defer;		/* ours, declined -> signal path */
 uint32_t	bf_n_aline;		/* ours, counted, chained (P3 pending) */
 uint32_t	bf_n_chain_priv;	/* not ours */
 uint32_t	bf_n_chain_aline;	/* not ours */
+uint32_t	bf_n_emulop;		/* EMUL_OPs that reach userland */
+uint32_t	bf_n_bmove;		/* BLOCK_MOVE handled in-kernel */
+static struct timespec bf_eo_t0;	/* entry time of a sampled EMUL_OP */
+static int	bf_eo_pending;
+static uint32_t	bf_eo_ns;		/* EMUL_OP trap -> next trap, sampled */
 
 /*
  * Single-step tracing, for the 0x9fc0000 hunt.  When an A-line trap is
@@ -173,6 +178,25 @@ static int	bf_tracing;		/* sticky: keep T1 across SR writes */
  * for.
  */
 static int	bf_diag;
+
+/*
+ * Per-trap cost meter.
+ *
+ * Deriving cost from traps/s and top's system% is unreliable: trap rate
+ * depends on what the guest is doing and system time includes X and
+ * everything else.  Time the handler directly instead -- but amortise
+ * the clock read by timing a BLOCK of 4096 traps rather than one, so the
+ * two nanouptime() calls cost nothing per trap.
+ *
+ * Reading the VIA timer directly was considered and rejected: reading
+ * T1C-L clears the timer interrupt flag and would break the kernel clock.
+ */
+#define BF_COST_BLOCK	4096
+static uint32_t	bf_cost_ns;		/* ns for the last completed block */
+static uint32_t	bf_cost_seq;
+static struct timespec bf_cost_t0;
+static int	bf_cost_sample;
+static uint32_t	bf_clock_ns;	/* cost of nanouptime itself */
 #define BF_MARK_ARM	0xfeedfaceu	/* ring marker: tracing armed here */
 
 /* Registered user addresses of Basilisk's virtual-SR state. */
@@ -184,7 +208,7 @@ void bf_stub_aline(void);
 int bf_ctrap_priv(uint32_t *r);
 int bf_ctrap_aline(uint32_t *r);
 int bf_ctrap_trace(uint32_t *r);
-void bf_clog_ill(uint32_t *r);
+int bf_clog_ill(uint32_t *r);
 static void bf_watch_check(uint32_t here);
 
 /*
@@ -338,9 +362,14 @@ __asm(
 "	movl	%sp,%sp@-\n"
 "	jbsr	bf_clog_ill\n"
 "	addql	#4,%sp\n"
+"	tstl	%d0\n"
+"	jeq	2f\n"
 "	moveml	%sp@+,#0x7fff\n"
 "	addql	#8,%sp\n"
-"	movl	bf_orig_ill,%sp@-\n"	/* ALWAYS chain: EMUL_OP is userland's */
+"	rte\n"				/* handled here */
+"2:	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
+"	movl	bf_orig_ill,%sp@-\n"	/* chain: EMUL_OP is userland's */
 "	rts\n"
 "0:	movl	%sp@+,%d0\n"
 "1:	movl	bf_orig_ill,%sp@-\n"
@@ -416,6 +445,44 @@ bf_ctrap_priv(uint32_t *r)
 	if (__predict_false(bf_diag)) {
 		bf_watch_check(pc);
 		bf_al_prune(bf_usp_read());
+	}
+
+	/*
+	 * Sample ONE trap in BF_COST_BLOCK from entry to exit.  Timing a
+	 * whole block instead measures the interval between traps, which
+	 * includes guest execution and idle gaps -- the first version of
+	 * this meter did that and read 728us against a 135us interval.
+	 */
+	if (__predict_false(bf_eo_pending)) {
+		struct timespec now;
+		int64_t d;
+
+		nanouptime(&now);
+		d = (int64_t)(now.tv_sec - bf_eo_t0.tv_sec) * 1000000000 +
+		    (now.tv_nsec - bf_eo_t0.tv_nsec);
+		if (d > 0 && d < 1000000000LL)
+			bf_eo_ns = (uint32_t)d;
+		bf_eo_pending = 0;
+	}
+
+	bf_cost_sample = ((bf_cost_seq++ & (BF_COST_BLOCK - 1)) == 0);
+	if (__predict_false(bf_cost_sample)) {
+		struct timespec cal;
+		int64_t c;
+
+		/*
+		 * Calibrate: two back-to-back reads measure what the clock
+		 * itself costs, so the handler figure can be corrected.  On
+		 * slow hardware the meter can easily dominate what it
+		 * measures.
+		 */
+		nanouptime(&bf_cost_t0);
+		nanouptime(&cal);
+		c = (int64_t)(cal.tv_sec - bf_cost_t0.tv_sec) * 1000000000 +
+		    (cal.tv_nsec - bf_cost_t0.tv_nsec);
+		if (c >= 0 && c < 10000000)
+			bf_clock_ns = (uint32_t)c;
+		bf_cost_t0 = cal;
 	}
 
 	if (ufetch_16((const uint16_t *)pc, &op))
@@ -630,6 +697,18 @@ bf_ctrap_priv(uint32_t *r)
 		bf_sr_balance--;
 	}
 
+	if (__predict_false(bf_cost_sample)) {
+		struct timespec now;
+		int64_t d;
+
+		nanouptime(&now);
+		d = (int64_t)(now.tv_sec - bf_cost_t0.tv_sec) * 1000000000 +
+		    (now.tv_nsec - bf_cost_t0.tv_nsec);
+		if (d > 0 && d < 10000000)
+			bf_cost_ns = (uint32_t)d;
+		bf_cost_sample = 0;
+	}
+
 	if (__predict_false(bf_tracing))
 		f->sr |= 0x8000;	/* survive rte / move-to-sr */
 
@@ -778,17 +857,51 @@ bf_watch_check(uint32_t here)
  * T1 is in PSL_MBZ, so the signal path that services EMUL_OP necessarily
  * strips it.  One ring entry per EMUL_OP, no behaviour change.
  */
-void
+int
 bf_clog_ill(uint32_t *r)
 {
 	struct bf_hwframe *f = BF_FRAME(r);
 	struct bf_tr_ent *e;
+	uint16_t eop;
 
 	if (__predict_false(curproc->p_pid != bf_pid))
-		return;
+		return 0;
+
+	/*
+	 * EMUL_OP BLOCK_MOVE (0x7130) exists only to flush the code cache
+	 * after a guest BlockMove -- emul_op.cpp does nothing else for it.
+	 * At an idle System 7.5 desktop it is 114 of the 174 EMUL_OPs per
+	 * second, and every one costs a full signal round trip into
+	 * userland and back.  The kernel can do the same work with one
+	 * instruction, so handle it here and never wake the emulator.
+	 *
+	 * The ROM patch is EMUL_OP; moveq #0,d0; rts -- so simply stepping
+	 * the pc past the EMUL_OP lets the guest run the rest natively.
+	 */
+	if (ufetch_16((const uint16_t *)bf_frame_pc(f), &eop) == 0 &&
+	    eop == 0x7130) {
+		__asm volatile(".word 0xf4f8");	/* cpusha bc */
+		bf_frame_set_pc(f, bf_frame_pc(f) + 2);
+		bf_n_bmove++;
+		return 1;
+	}
+
+	bf_n_emulop++;		/* counted: these reach the signal path */
+
+	/*
+	 * Time one EMUL_OP in 64, from its trap to the next trap of any
+	 * kind.  That brackets the whole userland round trip: signal
+	 * delivery, EmulOp servicing, setcontext, and the guest running on
+	 * to its next trap.  An upper bound, but the right order of
+	 * magnitude, and it needs no cooperation from userland.
+	 */
+	if (__predict_false((bf_n_emulop & 63) == 0)) {
+		nanouptime(&bf_eo_t0);
+		bf_eo_pending = 1;
+	}
 
 	if (!bf_diag)
-		return;
+		return 0;
 	bf_watch_check(bf_frame_pc(f));
 
 	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
@@ -808,6 +921,7 @@ bf_clog_ill(uint32_t *r)
 	}
 	e->usp = bf_usp_read();
 	bf_tr_n++;
+	return 0;
 }
 
 int
@@ -1096,6 +1210,32 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLFLAG_READONLY, CTLTYPE_INT, "swapped",
 			    SYSCTL_DESCR("VBR points at the module's table"),
 			    NULL, 0, &bf_swapped, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_bmove",
+			    SYSCTL_DESCR("BLOCK_MOVE serviced in-kernel"),
+			    NULL, 0, &bf_n_bmove, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "emulop_ns",
+			    SYSCTL_DESCR("EMUL_OP trap to next trap, sampled"),
+			    NULL, 0, &bf_eo_ns, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "n_emulop",
+			    SYSCTL_DESCR("EMUL_OPs, which all take the "
+			        "signal path"),
+			    NULL, 0, &bf_n_emulop, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "clock_ns",
+			    SYSCTL_DESCR("cost of nanouptime() itself"),
+			    NULL, 0, &bf_clock_ns, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "cost_ns",
+			    SYSCTL_DESCR("ns inside the handler for one sampled trap"),
+			    NULL, 0, &bf_cost_ns, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_INT, "n_fast",

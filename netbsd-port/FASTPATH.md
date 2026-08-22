@@ -342,3 +342,41 @@ The idle spin is therefore still the reason an idle desktop pins the CPU,
 and remains unsolved.  It matters less than it looks: the machine has
 nothing else to do, and what makes the guest FEEL slow is per-trap cost
 while it is working, not what it does while idle.
+
+
+## Lever: BLOCK_MOVE serviced in the kernel (27% faster boot)
+
+The fast path itself was never the problem.  Measured properly -- timing
+one sampled trap from handler entry to exit, and CALIBRATING against the
+cost of the clock read itself (nanouptime costs 20.4us here, more than
+the thing being measured) -- the handler runs in **13-14us**, essentially
+the 15us the design assumed.  At 7,700 traps/s that is 11% of the
+machine, not the 75% system time being burned.
+
+The real cost was EMUL_OPs, which each take a full signal round trip
+into userland.  At an idle System 7.5 desktop there were 174/s, and
+**114 of them were BLOCK_MOVE** -- whose entire job in emul_op.cpp is
+FlushCodeCache.  The kernel can do that with one `cpusha`, so bfast now
+services opcode 0x7130 at trap level: flush, step the pc past the
+EMUL_OP, rte.  The ROM patch is `EMUL_OP; moveq #0,d0; rts`, so the
+guest simply runs the rest natively.
+
+    boot to settled     104s  ->  76s     (-27%)
+    CPU user/system     33/67 ->  47/53
+    EMUL_OPs to userland  174/s -> 103/s
+
+Measured with `bootbench.sh` on the target, which watches the kernel trap
+counter settle -- cheap enough not to perturb what it measures, unlike
+fbshot, which takes ~20s and competes with the emulator for the CPU.
+
+### Things tried that did NOT help, with measurements
+
+- **Whole-cache flush above 8KB in FlushCodeCache** (userland): boot 104s
+  vs 102s with it disabled -- no effect, because the hot BlockMoves are
+  smaller than the threshold.  Kept (harmless, and it guards against
+  pathological ranges) but it earns nothing.  Note it must be gated on
+  `native_traps_ready`: cpusha is privileged and FlushCodeCache runs
+  during ROM patching before any handler exists, where it kills the
+  process with SIGILL and no output at all.
+- **--idlewait true**: hangs the guest.  See above.
+- **Gating the diagnostics**: ~6%.  Worth having, not a lever.
