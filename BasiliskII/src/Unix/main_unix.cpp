@@ -100,6 +100,7 @@ using std::string;
 #include "prefs.h"
 #include "prefs_editor.h"
 #include "macos_util.h"
+#include "adb.h"
 #include "user_strings.h"
 #include "version.h"
 #include "main.h"
@@ -1167,6 +1168,21 @@ int main(int argc, char **argv)
 
 #if defined(__NetBSD__) && defined(__m68k__)
 	/*
+	 * BII_SHIFT_BOOT=1 holds the Shift key down from before the guest
+	 * starts until a few seconds in, which is how a Mac is told to boot
+	 * with extensions disabled.  Done through the ADB layer rather than
+	 * through X because the emulator grabs the keyboard, and because a
+	 * physical hand on the keyboard is not available to a script.
+	 * 0x38 is the Mac keycode for Shift.
+	 */
+	if (getenv("BII_SHIFT_BOOT") != NULL) {
+		extern bool bii_shift_boot;
+		bii_shift_boot = true;
+		ADBKeyDown(0x38);
+		fprintf(stderr, "SHIFT held for boot (extensions off)\n");
+	}
+
+	/*
 	 * TEMPORARY, diagnostic: BII_NO_TICK=1 suppresses the 60Hz tick.
 	 * The crash hunt has an unavoidable blind spot -- sigirq_handler
 	 * must strip T1 before setcontext sees the context, so the window
@@ -1570,6 +1586,8 @@ static void one_tick(...)
 
 #ifdef USE_PTHREADS_SERVICES
 bool tick_inhibit;
+bool bii_shift_boot;
+static long bii_shift_ticks;
 static void *tick_func(void *arg)
 {
 	uint64 start = GetTicks_usec();
@@ -1578,6 +1596,11 @@ static void *tick_func(void *arg)
 	while (!tick_thread_cancel) {
 		if (!tick_inhibit)
 			one_tick();
+		if (bii_shift_boot && ++bii_shift_ticks > 60 * 8) {
+			bii_shift_boot = false;
+			ADBKeyUp(0x38);
+			fprintf(stderr, "SHIFT released\n");
+		}
 		next += 16625;
 		int64 delay = next - GetTicks_usec();
 		if (delay > 0)

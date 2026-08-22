@@ -610,6 +610,29 @@ guest is entitled to take trap #2 while trap #1 is in flight.  Our
 reflection is reproducing hardware behaviour correctly, and the nesting
 is not a defect of this port.
 
+AND IT IS NOT THE DISK IMAGE.  A completely different System 7.5 install
+(a stock 200MB image, unrelated to Applesex.hfv) fails at exactly the
+same place:
+
+    Caught SIGSEGV at address 0x9fc0000 [IP=0x9fc0000]
+    a2  09fc0000     a3  09fa0000     pc  09fc0000
+
+Same fault address, same registers, same shape -- and, tellingly, the
+trap ring shows the same RAM hook region and the same EMUL_OP (0x712c at
+0086c6ea) leading in, but at a different stack depth (a7=005fa156 rather
+than 005fa1a2), so it is the same defect reached by a slightly different
+path rather than a coincidence of layout.
+
+Two disk images, independently sourced, failing identically: the volume
+contents are exonerated.  Whatever this is, it is in the emulator or in
+this port, and it is reproducible on stock System 7.5.
+
+Worth recording alongside: a genuinely broken image looks completely
+different.  A truncated copy of the same install (interrupted transfer,
+45MB of 200MB) crashed at 0xffffff00 with IP in ROM at 0x80dc0c after a
+burst of one repeating EMUL_OP -- the signature of reads running off the
+end of the file.  Nothing like the 0x9fc0000 fault.
+
 So the remaining candidate is the first: the resume path selects the
 wrong frame.  That is guest/ROM-patch territory rather than emulator
 territory -- which is consistent with everything else that has been
