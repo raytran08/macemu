@@ -729,6 +729,29 @@ bf_ctrap_trace(uint32_t *r)
 	 */
 	bf_watch_check(pc);
 
+	/*
+	 * The ROM fill loop at 40826e72..40826e88 (`movel %d0,%a0@+` /
+	 * `dbf %d1`) is what overwrites the guest stack.  Log its base and
+	 * counter, but only once a0 has strayed near the stack -- logging
+	 * every iteration would be thousands of entries of nothing.
+	 * 0x00500000 is comfortably above any table it should be filling
+	 * and below the observed stack around 0x005fa000.
+	 */
+	if (__predict_false(pc == 0x40826e86)) {
+		uint32_t a0 = BF_R_A(r, 0);
+
+		if (a0 >= 0x00500000) {
+			struct bf_tr_ent *fe =
+			    &bf_tr[bf_tr_n & (BF_TRN - 1)];
+
+			fe->pc = 0xf111u << 16;	/* marker: fill in stack */
+			fe->a2 = a0;		/* destination */
+			fe->fp = BF_R_D(r, 0);	/* value being stored */
+			fe->usp = BF_R_D(r, 1);	/* dbf counter remaining */
+			bf_tr_n++;
+		}
+	}
+
 	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
 	e->pc = pc;
 	e->a2 = BF_R_A(r, 2);

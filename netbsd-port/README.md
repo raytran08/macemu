@@ -374,10 +374,38 @@ the filled longword is later popped as a0 by the resume tail, the jmp
 lands 32 bytes into the RAM hook, addql #2,a7 skews the stack, and the
 rts pops a misaligned longword into the PC.
 
-Next, and it is a small step: log a0/d0/d1 at 40826e86 to see the fill's
-base and count, then work back to what set them -- the likely culprit is
-an earlier EMUL_OP-serviced query returning a wrong size or pointer,
-since ROM code filling its own table would not otherwise reach 0x5fa194.
+Done, and the fill loop is INNOCENT.  Logging a0/d0/d1 at 40826e86
+whenever a0 has strayed above 0x00500000 produces ZERO events across a
+whole run to the crash: that loop never writes anywhere near the stack.
+
+Re-reading the watch marker shows why the inference was wrong.  Its
+`here` field is 0086c6ea -- the EMUL_OP -- not a traced pc, so the change
+was noticed by the TRAP-TIME check at that EMUL_OP, not by the trace
+handler at 40826e88.  The last traced instruction merely happens to be
+the last one before the trace went dark.  The write therefore falls in
+the untraced gap between 40826e88 and the EMUL_OP: the blind spot again,
+and this technique cannot close it, because re-arming needs a privileged
+op that does not occur in the gap.
+
+STATUS: the failure is understood end to end except for the single write.
+Confirmed chain, instruction by instruction:
+
+    [005fa194] holds 00010f4a  (should hold 00010f2a)
+    4082661e  moveal %sp@+,%a0      a0 <- [005fa194]
+    40826622  jmp    %a0@           -> 32 bytes into the RAM hook
+    00010f4a  addql  #2,a7          two-byte skew
+    00010f4c  rts                   pops misaligned -> PC = 0x09fc0000
+
+Exonerated by direct test: the build, the disk image, bfast, the A-line
+vector, the Toolbox dispatch table, the ROM alias, EMUL_OP register
+save/restore, the 60Hz tick, _SCSIDispatch, and now the ROM fill loop.
+
+The one technique left that does not depend on T1: mprotect the guest
+stack page read-only and let the existing SIGSEGV path name the faulting
+instruction.  It needs care -- the stack is written constantly, so it
+must be armed late (e.g. from the EMUL_OP just before the window) and
+disarmed immediately after reporting -- but it is the only instrument
+that sees writes regardless of trap state.
 
 Two tracer improvements needed before the next round, both learnt here:
 - gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into
