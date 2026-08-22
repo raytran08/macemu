@@ -99,9 +99,51 @@ the idle Disk Tools workload.  It is also a bug class this port has hit
 before -- see commit 6df9880d, "Fix the 60Hz interrupt corrupting
 non-guest context".
 
-Next instrument, in order of cheapness: record a2/a3 in the trap ring so
-their values can be seen across the interrupt boundary; then compare the
-frame sigirq_handler pushes against what the guest's RTE pops.
+That interrupt lead did not survive contact either.  With a2/a3 recorded
+in the ring and interrupt DELIVERIES marked, a run shows **no interrupt
+at all** in the final 24 events: the 0x7129 entries are the guest
+executing Basilisk's IRQ opcode from inside the patched ROM, not
+sigirq_handler injecting a frame.  And a2/a3 are *sane pointers*
+(0x00003024, 0x005faefc) at every trap including the last one; they only
+become Fixed values in the stretch between the final trap and the fault.
+
+Nor is it a jmp through a2.  Scanning the ROM for jmp/jsr (a2) forms
+around _FixRatio, the dispatcher, and the Fixed-math caller finds none,
+so PC == a2 is a correlation -- the dispatcher restores a2 and the
+return address from neighbouring stack slots -- not a jump.
+
+The whole dispatch chain has now been verified correct by disassembly:
+
+    8099b0:  movel %a2,%sp@-        sp' = sp-4
+    8099b2:  movel %d2,%sp@-        sp' = sp-8
+    8099b4:  moveal %sp@(10),%a2    sp-8+10 = sp+2 = the PC field
+    8099b8:  movew %a2@+,%d2        read the trap word
+    8099c6:  movel @(0x1e00,%d2:w:4),%sp@(8)   -> writes over sp+0
+    8099ce:  movel %a2,%sp@(12)                -> writes over sp+4
+    8099d2:  movel %sp@+,%d2
+    8099d4:  moveal %sp@+,%a2
+    8099d6:  rts
+
+The dispatcher REWRITES the exception frame in place into
+[handler][return = trapPC+2] and reaches the handler with rts, discarding
+the stacked SR (harmless: real hardware is in supervisor mode either way,
+and Basilisk tracks the guest SR separately in EmulatedSR).  Every offset
+matches the 8-byte format-0 frame sigill_handler pushes.  A868 resolves
+through 0x1E00 + (0xA868-0xAC00 sign-extended)*4 = 0xFA0, which is the
+entry we dumped and found sane.
+
+So: frame layout correct, vector correct, table correct, handler correct,
+registers sane until the last trap, no interrupt in the window.  The
+corruption happens inside the window between the final A-line trap and
+the fault, with nothing in the emulator's own trap path implicated.
+
+Remaining hypotheses, for whoever picks this up: (a) another thread --
+the 60Hz tick or XPRAM watchdog -- writing guest memory under the
+handler; (b) the guest already being in bad state from an earlier
+EMUL_OP-serviced call, with the Fixed-math loop merely where it finally
+falls over.  Static analysis is exhausted; the next instrument is
+dynamic, e.g. the 68040 trace bit to single-step from the last A-line
+trap into the handler.
 
 Instrumentation for this is in main_unix.cpp behind the SIGSEGV dump: a
 24-entry ring of (pc, opcode, a7) filled on every signal-path trap, the

@@ -1517,113 +1517,23 @@ static void *tick_func(void *arg)
  *  Virtual 68k interrupt handler
  */
 
-static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
-{
-	/*
-	 * NetBSD stopped exposing struct sigcontext to userland (it is now
-	 * guarded by _LIBC || _KERNEL in m68k/signal.h), so the interrupted
-	 * 68k state comes from the ucontext instead.  m68k/mcontext.h lays
-	 * __gregs out as d0-d7 then a0-a7 then PC and PS, which is exactly
-	 * the order M68kRegisters expects, so regs can point straight at it.
-	 *
-	 * Note a7 and the stack pointer are now the same storage rather than
-	 * two fields that had to be kept in step; assigning both is harmless
-	 * and left alone to keep this diff readable.
-	 */
-	ucontext_t *ucp = (ucontext_t *)uap;
-	__greg_t *gr = ucp->uc_mcontext.__gregs;
-	__greg_t &sc_pc = gr[_REG_PC];
-	__greg_t &sc_ps = gr[_REG_PS];
-	__greg_t &sc_sp = gr[_REG_A7];
-	M68kRegisters *regs = (M68kRegisters *)&gr[_REG_D0];
-
-	// Interrupts disabled? Then do nothing
-	if (EmulatedSR & 0x0700)
-		return;
-
-	/*
-	 * Only interrupt the GUEST.  This signal arrives on a timer and can
-	 * land anywhere -- inside the emulator's own code, inside libc, or
-	 * in another thread entirely -- and the EmulatedSR mask above only
-	 * covers EmulOp.  Injecting a Mac interrupt frame in those cases
-	 * captures a HOST pc as though it were guest code; MacOS later
-	 * RTEs to it and jumps into nowhere.
-	 *
-	 * Observed exactly that: a frame with a plausible SR (0x2010, which
-	 * is sc_ps|EmulatedSR from right here) and pc=0x0c51c5a0, an address
-	 * on the host heap between our text at 0x08000000 and the mapping
-	 * arena at 0x10000000.
-	 *
-	 * Guest code lives in RAM from 0 and ROM immediately above it, so
-	 * anything outside that is not ours to interrupt.  Dropping the tick
-	 * is harmless: another arrives in 1/60s.
-	 */
-	static unsigned long irq_deferred, irq_delivered;
-
-	if ((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) {
-		/*
-		 * Not in guest code, so a frame built here would capture a
-		 * host pc.  Leave the interrupt PENDING rather than losing
-		 * it: InterruptFlags stays set and EmulOpTrampoline
-		 * re-triggers on the way back out of native code.
-		 */
-		irq_deferred++;
-		if ((irq_deferred % 200) == 1)
-			fprintf(stderr, "irq: deferred=%lu delivered=%lu\n",
-			    irq_deferred, irq_delivered);
-		return;
-	}
-	irq_delivered++;
-	if ((irq_delivered % 200) == 1)
-		fprintf(stderr, "irq: deferred=%lu delivered=%lu\n",
-		    irq_deferred, irq_delivered);
-
-
-	// Set up interrupt frame on stack
-	uint32 a7 = regs->a[7];
-	a7 -= 2;
-	WriteMacInt16(a7, 0x64);
-	a7 -= 4;
-	WriteMacInt32(a7, sc_pc);
-	a7 -= 2;
-	WriteMacInt16(a7, sc_ps | EmulatedSR);
-	sc_sp = regs->a[7] = a7;
-
-	// Set interrupt level
-	EmulatedSR |= 0x2100;
-
-	// Jump to MacOS interrupt handler on return
-	sc_pc = ReadMacInt32(0x64);
-	/*
-	 * Every path through this handler converges here, so what __gregs
-	 * holds now is exactly what setcontext() will be asked to resume.
-	 * A context it refuses is not a signal: setcontext() returns EINVAL
-	 * inside libc's signal trampoline and libc exits with that errno,
-	 * with no message and no core.  That failure mode is invisible
-	 * enough to be worth two instructions per trap to catch.
-	 */
-	{
-		uint32 p = (uint32)sc_pc, t = (uint32)sc_ps;
-
-		if ((t & 0xffff7fe0u) != 0)   /* PSL_MBZ|PSL_IPL|PSL_S */
-			fprintf(stderr, "%s: SUSPECT CONTEXT pc=%08x ps=%08x "
-			    "a7=%08x\n", "sigirq", (unsigned)p, (unsigned)t,
-			    (unsigned)sc_sp);
-	}
-
-}
-
-
-/*
- *  SIGILL handler, for emulation of privileged instructions and executing
- *  A-Trap and EMUL_OP opcodes
- */
-
 /* Recent-trap ring; dumped by sigsegv_dump_state after a wild jump. */
 #define BF_RING 24
-struct bf_ring_ent { uint32 pc; uint32 a7; uint16 op; };
+struct bf_ring_ent { uint32 pc; uint32 a7; uint32 a2; uint32 a3; uint16 op; };
 static struct bf_ring_ent bf_ring[BF_RING];
 static unsigned bf_ring_i;
+
+/* Not a real opcode: marks an event rather than a trap. */
+#define BF_MARK_IRQ	0xffff
+
+static inline void
+bf_ring_add(uint32 pc, uint32 a7, uint32 a2, uint32 a3, uint16 op)
+{
+	struct bf_ring_ent *e = &bf_ring[bf_ring_i & (BF_RING - 1)];
+
+	e->pc = pc; e->a7 = a7; e->a2 = a2; e->a3 = a3; e->op = op;
+	bf_ring_i++;
+}
 
 void bf_dump_ring(void);
 void
@@ -1729,12 +1639,126 @@ bf_dump_ring(void)
 
 		if (bf_ring[j].pc == 0)
 			continue;
-		fprintf(stderr, "  pc=%08x op=%04x a7=%08x%s\n",
-		    bf_ring[j].pc, bf_ring[j].op, bf_ring[j].a7,
-		    (bf_ring[j].op & 0xf000) == 0xa000 ? "  A-line" :
-		    (bf_ring[j].op & 0xff00) == 0x7100 ? "  EMUL_OP" : "");
+		if (bf_ring[j].op == BF_MARK_IRQ)
+			fprintf(stderr, "  pc=%08x  *** INTERRUPT *** "
+			    "a7=%08x a2=%08x a3=%08x\n",
+			    bf_ring[j].pc, bf_ring[j].a7, bf_ring[j].a2,
+			    bf_ring[j].a3);
+		else
+			fprintf(stderr, "  pc=%08x op=%04x a7=%08x a2=%08x "
+			    "a3=%08x%s\n",
+			    bf_ring[j].pc, bf_ring[j].op, bf_ring[j].a7,
+			    bf_ring[j].a2, bf_ring[j].a3,
+			    (bf_ring[j].op & 0xf000) == 0xa000 ? "  A-line" :
+			    (bf_ring[j].op & 0xff00) == 0x7100 ? "  EMUL_OP" : "");
 	}
 }
+
+static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
+{
+	/*
+	 * NetBSD stopped exposing struct sigcontext to userland (it is now
+	 * guarded by _LIBC || _KERNEL in m68k/signal.h), so the interrupted
+	 * 68k state comes from the ucontext instead.  m68k/mcontext.h lays
+	 * __gregs out as d0-d7 then a0-a7 then PC and PS, which is exactly
+	 * the order M68kRegisters expects, so regs can point straight at it.
+	 *
+	 * Note a7 and the stack pointer are now the same storage rather than
+	 * two fields that had to be kept in step; assigning both is harmless
+	 * and left alone to keep this diff readable.
+	 */
+	ucontext_t *ucp = (ucontext_t *)uap;
+	__greg_t *gr = ucp->uc_mcontext.__gregs;
+	__greg_t &sc_pc = gr[_REG_PC];
+	__greg_t &sc_ps = gr[_REG_PS];
+	__greg_t &sc_sp = gr[_REG_A7];
+	M68kRegisters *regs = (M68kRegisters *)&gr[_REG_D0];
+
+	// Interrupts disabled? Then do nothing
+	if (EmulatedSR & 0x0700)
+		return;
+
+	/*
+	 * Only interrupt the GUEST.  This signal arrives on a timer and can
+	 * land anywhere -- inside the emulator's own code, inside libc, or
+	 * in another thread entirely -- and the EmulatedSR mask above only
+	 * covers EmulOp.  Injecting a Mac interrupt frame in those cases
+	 * captures a HOST pc as though it were guest code; MacOS later
+	 * RTEs to it and jumps into nowhere.
+	 *
+	 * Observed exactly that: a frame with a plausible SR (0x2010, which
+	 * is sc_ps|EmulatedSR from right here) and pc=0x0c51c5a0, an address
+	 * on the host heap between our text at 0x08000000 and the mapping
+	 * arena at 0x10000000.
+	 *
+	 * Guest code lives in RAM from 0 and ROM immediately above it, so
+	 * anything outside that is not ours to interrupt.  Dropping the tick
+	 * is harmless: another arrives in 1/60s.
+	 */
+	static unsigned long irq_deferred, irq_delivered;
+
+	if ((uint32)sc_pc >= RAMSize + ROM_MAX_SIZE) {
+		/*
+		 * Not in guest code, so a frame built here would capture a
+		 * host pc.  Leave the interrupt PENDING rather than losing
+		 * it: InterruptFlags stays set and EmulOpTrampoline
+		 * re-triggers on the way back out of native code.
+		 */
+		irq_deferred++;
+		if ((irq_deferred % 200) == 1)
+			fprintf(stderr, "irq: deferred=%lu delivered=%lu\n",
+			    irq_deferred, irq_delivered);
+		return;
+	}
+	irq_delivered++;
+	if ((irq_delivered % 200) == 1)
+		fprintf(stderr, "irq: deferred=%lu delivered=%lu\n",
+		    irq_deferred, irq_delivered);
+
+
+	// Set up interrupt frame on stack
+	uint32 a7 = regs->a[7];
+	a7 -= 2;
+	WriteMacInt16(a7, 0x64);
+	a7 -= 4;
+	WriteMacInt32(a7, sc_pc);
+	a7 -= 2;
+	WriteMacInt16(a7, sc_ps | EmulatedSR);
+	sc_sp = regs->a[7] = a7;
+
+	// Set interrupt level
+	EmulatedSR |= 0x2100;
+
+	/* Mark delivery so a2/a3 can be compared across the interrupt. */
+	bf_ring_add((uint32)sc_pc, (uint32)sc_sp, (uint32)gr[_REG_A0 + 2],
+	    (uint32)gr[_REG_A0 + 3], BF_MARK_IRQ);
+
+	// Jump to MacOS interrupt handler on return
+	sc_pc = ReadMacInt32(0x64);
+	/*
+	 * Every path through this handler converges here, so what __gregs
+	 * holds now is exactly what setcontext() will be asked to resume.
+	 * A context it refuses is not a signal: setcontext() returns EINVAL
+	 * inside libc's signal trampoline and libc exits with that errno,
+	 * with no message and no core.  That failure mode is invisible
+	 * enough to be worth two instructions per trap to catch.
+	 */
+	{
+		uint32 p = (uint32)sc_pc, t = (uint32)sc_ps;
+
+		if ((t & 0xffff7fe0u) != 0)   /* PSL_MBZ|PSL_IPL|PSL_S */
+			fprintf(stderr, "%s: SUSPECT CONTEXT pc=%08x ps=%08x "
+			    "a7=%08x\n", "sigirq", (unsigned)p, (unsigned)t,
+			    (unsigned)sc_sp);
+	}
+
+}
+
+
+/*
+ *  SIGILL handler, for emulation of privileged instructions and executing
+ *  A-Trap and EMUL_OP opcodes
+ */
 
 static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 {
@@ -1763,10 +1787,8 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	 * Last-N trap ring, for post-mortem after a wild jump.  No I/O on
 	 * the hot path: two stores and a mask.
 	 */
-	bf_ring[bf_ring_i & (BF_RING - 1)].pc = (uint32)sc_pc;
-	bf_ring[bf_ring_i & (BF_RING - 1)].op = opcode;
-	bf_ring[bf_ring_i & (BF_RING - 1)].a7 = (uint32)sc_sp;
-	bf_ring_i++;
+	bf_ring_add((uint32)sc_pc, (uint32)sc_sp, (uint32)gr[_REG_A0 + 2],
+	    (uint32)gr[_REG_A0 + 3], opcode);
 
 	/*
 	 * Opcode histogram.
