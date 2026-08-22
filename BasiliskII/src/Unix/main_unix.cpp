@@ -1601,6 +1601,22 @@ bf_dump_ring(void)
 	}
 
 	/*
+	 * The RAM hook around 0x00010f2a.  The watchpoint proved the
+	 * instruction at 0x00010f3a writes the value the fatal rts later
+	 * pops, and this is RAM, so it cannot be read from the ROM image --
+	 * dump it here for disassembly.
+	 */
+	{
+		uint32 a;
+
+		fprintf(stderr, "RAM hook 0x00010f20..0x00010f60:\n");
+		for (a = 0x00010f20; a < 0x00010f60; a += 8)
+			fprintf(stderr, "  %08x: %04x %04x %04x %04x\n", a,
+			    ReadMacInt16(a), ReadMacInt16(a + 2),
+			    ReadMacInt16(a + 4), ReadMacInt16(a + 6));
+	}
+
+	/*
 	 * The guest's trap dispatch tables.
 	 *
 	 * Addresses come from disassembling the ROM's own A-line handler at

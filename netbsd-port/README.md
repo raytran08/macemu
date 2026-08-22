@@ -221,6 +221,45 @@ proved the write at 005fa19e is an innocent push in a healthy context.
 The remaining candidate is the OTHER slot -- the one the rts actually
 reads at the fatal depth -- which was never watched.
 
+THE VALUES ARE NOT FIXED-POINT NUMBERS.  Dumping the RAM hook that the
+watchpoint fingered (0x00010f2a; RAM, so invisible in the ROM image)
+decodes to:
+
+    10f36:  pea    $09fa.w           push longword 0x000009fa
+    10f3a:  pea    $09fc.w           push longword 0x000009fc   <-- "the write"
+    10f3e:  movel  #$0000012c,-(sp)
+    10f44:  movew  #4,-(sp)          selector, a WORD
+    10f48:  a815                     _SCSIDispatch
+    10f4a:  addql  #2,a7
+    10f4c:  rts
+
+0x09fc0000 is simply the longword 0x000009fc READ TWO BYTES LOW: the low
+half of the 09fc push followed by the high half of the next.  Same for
+0x09fa0000.  Those are low-memory global ADDRESSES (0x9FA, 0x9FC), and
+every "Fixed 2554.0/2556.0" reading in the commits above is wrong.  The
+defect is a TWO-BYTE STACK SKEW, not an eight-byte one and not data
+corruption at all: the fatal rts pops 005fa19e where the aligned slot is
+005fa19c.
+
+That points straight at the word-sized selector and Basilisk's
+_SCSIDispatch replacement (emul_op.cpp, M68K_EMUL_OP_SCSI_DISPATCH),
+which does its own rtd emulation:
+
+    ret = ReadMacInt32(a7); sel = ReadMacInt16(a7 + 4); a7 += 6;
+    ... per-selector: write result at a7 + stack, set stack ...
+    r->a[0] = ret; r->a[1] = r->a[7] + stack;   // rom patch: move.l a1,a7; jmp (a0)
+
+Selector 4 is SCSIComplete, and this hook calls exactly that.  The
+arithmetic assumes the caller reserved result space BEFORE the params
+(the normal Pascal convention, under which the other selectors balance);
+this caller's shape -- three longword pushes, a word selector, then
+addql #2,a7 -- needs checking against that assumption, because a
+two-byte disagreement here produces precisely the observed skew.
+
+Do NOT simply subtract 2 to make it balance.  Establish the convention
+first: log a7 in and out per selector, compare against what each caller
+does afterwards, and fix the one that is actually wrong.
+
 Two tracer improvements needed before the next round, both learnt here:
 - gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into
   the emulator's own code and libc, so a wrapped ring can be entirely

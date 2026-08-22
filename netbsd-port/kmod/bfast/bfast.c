@@ -81,6 +81,8 @@ static uint32_t	bf_tr_window;		/* logged in the current window */
 static uint32_t	bf_trace_arm_pc;	/* sysctl: arm on this A-line pc */
 static uint32_t	bf_tr_armed_ret;	/* pc that closes the window */
 static uint32_t	bf_arm_now;		/* sysctl: arm at the next priv trap */
+static uint32_t	bf_watch_addr;		/* derived: what the fatal rts pops */
+static int	bf_tracing;		/* sticky: keep T1 across SR writes */
 #define BF_MARK_ARM	0xfeedfaceu	/* ring marker: tracing armed here */
 
 /* Registered user addresses of Basilisk's virtual-SR state. */
@@ -479,11 +481,15 @@ bf_ctrap_priv(uint32_t *r)
 		goto defer;
 	}
 
+	if (__predict_false(bf_tracing))
+		f->sr |= 0x8000;	/* survive rte / move-to-sr */
+
 	if (__predict_false(bf_arm_now)) {
 		struct bf_tr_ent *e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
 
 		bf_arm_now = 0;
 		f->sr |= 0x8000;
+		bf_tracing = 1;
 		bf_tr_window = 0;
 		e->pc = BF_MARK_ARM;
 		e->a2 = pc;		/* where the arm took effect */
@@ -536,9 +542,13 @@ bf_ctrap_aline(uint32_t *r)
 
 	if (__predict_false(bf_trace_arm_pc != 0 && pc == bf_trace_arm_pc)) {
 		f->sr |= 0x8000;	/* T1: trace every instruction */
+		bf_tracing = 1;
 		bf_tr_armed_ret = pc + 2;
 		bf_tr_window = 0;
 	}
+
+	if (__predict_false(bf_tracing))
+		f->sr |= 0x8000;
 
 	bf_n_aline++;
 	bf_n_fast++;
@@ -558,7 +568,6 @@ defer:
  * writer -- which is the previous entry's pc, since a trace exception
  * reports the NEXT instruction.
  */
-#define BF_WATCH_ADDR	0x005fa19eu
 #define BF_MARK_WRITE	0xdeadbeefu
 
 int
@@ -574,7 +583,28 @@ bf_ctrap_trace(uint32_t *r)
 	if (__predict_false(curproc->p_pid != bf_pid))
 		return 0;
 
-	if (ufetch_32((const uint32_t *)BF_WATCH_ADDR, &wv) == 0) {
+	/*
+	 * Trace GUEST code only.  T1 otherwise survives into the emulator's
+	 * own text and libc -- one run's entire 32768-entry ring held
+	 * nothing but host addresses.  Guest RAM is 8MB from 0 with ROM
+	 * just above it, so anything at or past 0x00a00000 is not the guest.
+	 */
+	if (__predict_false(pc >= 0x00a00000)) {
+		f->sr &= 0x7fff;
+		bf_tracing = 0;
+		return 1;
+	}
+
+	/*
+	 * Watchpoint on the slot the fatal rts actually reads.  The RAM
+	 * hook's rts at 00010f4c pops [usp]; arm the address the first time
+	 * we step that instruction, then report every change to it.
+	 */
+	if (__predict_false(pc == 0x00010f4c && bf_watch_addr == 0))
+		bf_watch_addr = bf_usp_read();
+
+	if (bf_watch_addr != 0 &&
+	    ufetch_32((const uint32_t *)bf_watch_addr, &wv) == 0) {
 		if (watch_valid && wv != watch_last) {
 			uint32_t wpc = bf_tr_n ?
 			    bf_tr[(bf_tr_n - 1) & (BF_TRN - 1)].pc : 0;
@@ -607,8 +637,10 @@ bf_ctrap_trace(uint32_t *r)
 	 * next armed A-line re-arms.  The ring wraps, so at the fault it
 	 * holds the last BF_TRN instructions regardless.
 	 */
-	if (bf_tr_window > BF_TRN)
+	if (bf_tr_window > BF_TRN) {
 		f->sr &= 0x7fff;
+		bf_tracing = 0;
+	}
 
 	return 1;
 }
@@ -759,6 +791,11 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    SYSCTL_DESCR("A-line pc that arms single-step "
 			        "tracing (0 = off)"),
 			    NULL, 0, &bf_trace_arm_pc, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "watch_addr",
+			    SYSCTL_DESCR("address the fatal rts pops"),
+			    NULL, 0, &bf_watch_addr, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_INT, "trace_n",
