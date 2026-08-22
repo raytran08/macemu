@@ -1646,6 +1646,48 @@ static void *tick_func(void *arg)
 
 unsigned long bf_t1_stripped;	/* T1 bits scrubbed before setcontext */
 
+/*
+ * Stack-delta audit for the USERLAND path.
+ *
+ * bfast audits the fast path in the kernel and found it correct, but the
+ * ops it declines -- roughly 1% -- are emulated here instead, by a
+ * separate copy of the same arithmetic.  A mistake in this copy would be
+ * rare and systematic, which is exactly the shape of the fault.  Same
+ * method: record the sp delta produced per opcode and compare against
+ * what the real instruction does.
+ */
+#define UD_N 64
+static uint16 ud_op[UD_N];
+static int32 ud_delta[UD_N];
+static uint32 ud_count[UD_N];
+static int ud_n;
+
+static void ud_note(uint16 op, int32 delta)
+{
+	int i;
+
+	for (i = 0; i < ud_n; i++)
+		if (ud_op[i] == op && ud_delta[i] == delta) {
+			ud_count[i]++;
+			return;
+		}
+	if (ud_n < UD_N) {
+		ud_op[ud_n] = op; ud_delta[ud_n] = delta;
+		ud_count[ud_n] = 1; ud_n++;
+	}
+}
+
+void ud_dump(void);
+void ud_dump(void)
+{
+	int i;
+
+	fprintf(stderr, "userland-path stack deltas (opcode, delta, count):\n");
+	for (i = 0; i < ud_n; i++)
+		fprintf(stderr, "  %04x  %+6d  %8u\n",
+		    ud_op[i], ud_delta[i], ud_count[i]);
+}
+
 /* Recent-trap ring; dumped by sigsegv_dump_state after a wild jump. */
 #define BF_RING 24
 struct bf_ring_ent { uint32 pc; uint32 a7; uint32 a2; uint32 a3; uint16 op; };
@@ -1726,6 +1768,11 @@ bf_dump_ring(void)
 				    ring[j].fp, ring[j].usp);
 			}
 		}
+	}
+
+	{
+		extern void ud_dump(void);
+		ud_dump();
 	}
 
 	/*
@@ -2040,6 +2087,8 @@ static void sigill_handler(int sig, siginfo_t *sip, void *uap)
 	 */
 	bf_ring_add((uint32)sc_pc, (uint32)sc_sp, (uint32)gr[_REG_A0 + 2],
 	    (uint32)gr[_REG_A0 + 3], opcode);
+
+	const uint32 ud_sp_in = (uint32)sc_sp;
 
 	/*
 	 * Opcode histogram.
@@ -2405,6 +2454,8 @@ ill:		printf("SIGILL num %d, code %d\n", sig, sip ? sip->si_code : 0);
 	 * with no message and no core.  That failure mode is invisible
 	 * enough to be worth two instructions per trap to catch.
 	 */
+	ud_note(opcode, (int32)((uint32)sc_sp - ud_sp_in));
+
 	{
 		uint32 p = (uint32)sc_pc, t = (uint32)sc_ps;
 

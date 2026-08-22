@@ -737,6 +737,26 @@ Every delta is what the real instruction does, and every rte is format 0
 with +8.  So the emulation's stack arithmetic is correct and that whole
 class is eliminated.  (Tool: `sddump` on the target.)
 
+USERLAND-PATH AUDIT (also clean).  The kernel audit covers only the fast
+path; roughly 1% of privileged ops are declined and emulated in
+sigill_handler instead, by a separate copy of the same arithmetic.  Same
+method applied there, measured to the crash:
+
+    71xx (all EMUL_OPs)   -70   -- the frame is pc(4)+sr(2)+a0-a7(32)
+                                   +d0-d7(32) = 70 bytes.  Correct.
+    4e7a/4e7b movec        +0   4e73 rte      +8
+    46df move (sp)+,sr     +2   46fc move #,sr  0
+    027c andi #,sr          0   46c1 move d1,sr 0
+
+Every delta is right, across ~1900 deferred traps of 25 distinct
+opcodes.  So BOTH copies of the stack arithmetic -- kernel and userland
+-- are correct, and no instruction we emulate moves the guest stack by
+the wrong amount.
+
+That closes the "our emulation miscounts the stack" hypothesis
+completely.  Whatever produces the two-byte skew is not an arithmetic
+error in either handler.
+
 One observation left over, not yet explained: 40e7 outnumbers 46df by 33.
 Those are the two halves of the usual critical-section idiom, so an
 imbalance is expected only where the path exits by rte instead, and the
