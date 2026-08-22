@@ -82,6 +82,17 @@ static uint32_t	bf_tr_n;		/* total logged since load */
 static uint32_t	bf_tr_window;		/* logged in the current window */
 static uint32_t	bf_trace_arm_pc;	/* sysctl: arm on this A-line pc */
 static uint32_t	bf_tr_armed_ret;	/* pc that closes the window */
+
+/*
+ * Event log: every pass through a handful of interesting pcs, kept in a
+ * small array of its own so it cannot be wrapped away by the 2.8M-entry
+ * instruction trace.  This is what makes healthy-vs-fatal comparison of
+ * the SAME code path possible within one run.
+ */
+#define BF_EVN		256
+struct bf_ev_ent { uint32_t pc, sp, fp, a0; };
+static struct bf_ev_ent bf_ev[BF_EVN];
+static uint32_t	bf_ev_n;
 static uint32_t	bf_arm_now;		/* sysctl: arm at the next priv trap */
 static uint32_t	bf_watch_addr;		/* derived: what the fatal rts pops */
 static int	bf_tracing;		/* sticky: keep T1 across SR writes */
@@ -735,6 +746,30 @@ bf_ctrap_trace(uint32_t *r)
 	 * slot when a trap happens; inside a traced window this sees every
 	 * single write, which is what is needed to name the writer.
 	 */
+	if (__predict_false(pc == 0x408265f0 || pc == 0x4082661e ||
+	    pc == 0x40826f78 || pc == 0x40826f6a ||
+	    pc == 0x408268ca)) {
+		struct bf_ev_ent *v = &bf_ev[bf_ev_n & (BF_EVN - 1)];
+		uint32_t sp = bf_usp_read();
+
+		v->pc = pc;
+		v->sp = sp;
+		v->fp = BF_R_A(r, 6);
+		/*
+		 * At the function's `link` (408268ca) the longword at [sp]
+		 * is the return address, which names the caller -- that is
+		 * the next question, so capture it here instead of a0.
+		 */
+		if (pc == 0x408268ca) {
+			uint32_t ra;
+
+			v->a0 = (ufetch_32((const uint32_t *)sp, &ra) == 0) ?
+			    ra : 0xffffffffu;
+		} else
+			v->a0 = BF_R_A(r, 0);
+		bf_ev_n++;
+	}
+
 	bf_watch_check(pc);
 
 	/*
@@ -944,6 +979,16 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLFLAG_READONLY, CTLTYPE_INT, "trace_n",
 			    SYSCTL_DESCR("instructions logged since load"),
 			    NULL, 0, &bf_tr_n, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_INT, "events_n",
+			    SYSCTL_DESCR("event log entries written"),
+			    NULL, 0, &bf_ev_n, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "events",
+			    SYSCTL_DESCR("struct {u32 pc,sp,fp,a0}[256]"),
+			    NULL, 0, bf_ev, sizeof(bf_ev),
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "trace_ring",

@@ -485,10 +485,39 @@ task is to find where the stack first diverges, which is a matter of
 walking sp backwards through the rings across successive EMUL_OP
 boundaries, comparing against a pass that survives.
 
-Practical note for whoever continues: the useful comparison is between
-two passes through the SAME code in one run (this path executes many
-times before the fatal one), not between runs.  bfast's rings already
-contain both.
+Done, with a dedicated event log (a 256-entry array recording every pass
+through a few chosen pcs, immune to the instruction ring wrapping).  Two
+passes through the same code, one run, side by side:
+
+    healthy:  40826f6a sp=005fa192 fp=005fa198
+              40826f78 sp=005fa1b2 fp=005fa198
+              408265f0 sp=005fa19c
+              4082661e sp=005fa19c   -> pops 00010f2a  (hook entry: correct)
+
+    fatal:    40826f6a sp=005fa18a fp=005fa190
+              40826f78 sp=005fa1aa fp=005fa190
+              408265f0 sp=005fa194
+              4082661e sp=005fa194   -> pops 00010f4a  (an A-line return addr)
+
+Exactly 8 bytes lower at every point -- sp, fp, and the popped slot.  The
+function is simply running one A-line frame deeper.  Its entry is
+`link %fp,#-138` at 0x408268ca (found by scanning the ROM for 0x4e56;
+the -138 frame matches the epilogue's fp@(-72)), and it spans
+408268ca..40826f7a.
+
+Catching the entry itself needs tracing armed before 408268ca, which
+means a much larger traced window; walking further up the call chain this
+way gets progressively more expensive.
+
+BETTER NEXT INSTRUMENT.  The skew is exactly one A-line frame, and A-line
+frames are pushed by our own reflection code, so count them instead of
+chasing them: in bfast, push the guest sp onto a small shadow stack at
+each A-line reflection and pop/compare at each rte that consumes an
+A-line-shaped frame.  A divergence identifies the exact trap whose frame
+is never consumed -- which is the leak -- without needing to trace any of
+the intervening code.  Mind that the Mac ROM legitimately unwinds past
+frames in places, so the shadow stack needs a resync rule rather than a
+strict assertion.
 
 Superseded options, kept for the record:
 1. Emulate the faulting store inside the SIGSEGV handler (decode the
