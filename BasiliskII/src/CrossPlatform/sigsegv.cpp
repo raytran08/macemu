@@ -2946,8 +2946,28 @@ catch_mach_exception_raise_state_identity(mach_port_t exception_port,
 
 #ifdef HAVE_SIGSEGV_RECOVERY
 // Handle bad memory accesses with signal handler
+#if defined(__NetBSD__) && (defined(m68k) || defined(__m68k__))
+/*
+ * Stash the whole register file for the post-mortem.  sigsegv_info_t
+ * carries only the fault address and the PC, which is not enough to say
+ * WHY control went somewhere impossible -- for that you need to see
+ * which register held the bad value and what the stack looked like.
+ */
+unsigned long bf_segv_regs[18];
+int bf_segv_have_regs;
+#endif
+
 static void sigsegv_handler(SIGSEGV_FAULT_HANDLER_ARGLIST)
 {
+#if defined(__NetBSD__) && (defined(m68k) || defined(__m68k__))
+	{
+		int i;
+		for (i = 0; i < 18; i++)
+			bf_segv_regs[i] = (unsigned long)SIGSEGV_CONTEXT_REGS[i];
+		bf_segv_have_regs = 1;
+	}
+#endif
+
 	// Call handler and reinstall the global handler, if required
 	if (handle_badaccess(SIGSEGV_FAULT_HANDLER_ARGS)) {
 #if (defined(HAVE_SIGACTION) ? defined(SIGACTION_NEED_REINSTALL) : defined(SIGNAL_NEED_REINSTALL))

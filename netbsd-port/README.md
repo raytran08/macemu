@@ -47,9 +47,42 @@ introduced.  A trap dispatch table holding one base while execution runs
 at the other is the obvious next thing to check, along with the Fixed
 traps' return path.
 
+The register file at the fault settles the mechanism:
+
+    a2  09fc0000   <== equals the PC
+    a3  09fa0000   Fixed 2554.0
+    d7  012c0000   Fixed 300.0
+    d6  0f4a0000   Fixed 3914.0
+    a7  005fa1a2
+
+PC == a2, so control transferred THROUGH a2 -- a jmp/jsr (a2) -- while a2
+held fixed-point data.  Every register holds a coherent Fixed value; the
+arithmetic in flight is sane.  What is wrong is that code expecting a2 to
+be a pointer was given control.  So this is a control-flow error upstream
+of the crash, not corrupted data at it: the guest's dispatch for the
+_FixRatio trap ends up somewhere that treats a2 as a routine address.
+
+Eliminated so far, each by direct test rather than argument:
+- the build, the disk image, the bfast module (all fault identically);
+- the A-line vector at guest 0x28 (written once at startup, never
+  changes across a whole run);
+- BasiliskII's EMUL_OP register save/restore.  Verified by reading:
+  sigill_handler pushes ascending d0-d7, a0-a7, sr, pc; the trampoline's
+  a0@(66) correctly indexes the PC past 64 bytes of registers plus the
+  SR word, and the restore is moveml sp@+,d0-d7/a0-a6, skip the stale a7
+  slot, rtr.  Consistent, no scrambling.
+
+The remaining suspect is the guest's Toolbox trap dispatch table -- what
+A868 resolves to, and whether it points at the ROM alias that matches
+where execution actually is.  Reading that table from the guest's low
+memory is the next instrument, and it needs Mac OS internals rather than
+more emulator instrumentation.
+
 Instrumentation for this is in main_unix.cpp behind the SIGSEGV dump: a
-24-entry ring of (pc, opcode, a7) filled on every signal-path trap, and a
-guest stack dump at the fault.  Both cost two stores on the hot path.
+24-entry ring of (pc, opcode, a7) filled on every signal-path trap, the
+guest stack, and the full register file captured in sigsegv.cpp's handler
+(sigsegv_info_t carries only addr and pc, which is not enough to say why
+control went somewhere impossible).  The hot-path cost is two stores.
 
 ### Correction: Applesex.hfv is NOT damaged; System 7.5 hits a real bug
 

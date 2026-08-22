@@ -1631,6 +1631,30 @@ bf_dump_ring(void)
 {
 	unsigned k;
 
+#if defined(__NetBSD__) && defined(__m68k__)
+	{
+		extern unsigned long bf_segv_regs[18];
+		extern int bf_segv_have_regs;
+		static const char *nm[18] = {
+		    "d0","d1","d2","d3","d4","d5","d6","d7",
+		    "a0","a1","a2","a3","a4","a5","a6","a7","pc","ps" };
+		int i;
+
+		if (bf_segv_have_regs) {
+			fprintf(stderr, "registers at the fault:\n");
+			for (i = 0; i < 18; i++) {
+				unsigned long v = bf_segv_regs[i];
+
+				fprintf(stderr, "  %-3s %08lx%s\n", nm[i], v,
+				    (v == 0x09fc0000UL) ? "   <== the "
+				        "fault address" :
+				    ((v >> 16) >= 0x0900 && (v >> 16) < 0x0a00)
+				        ? "   Fixed ~2500" : "");
+			}
+		}
+	}
+#endif
+
 	/*
 	 * Guest stack at the fault.  The wild jump left a return address
 	 * behind if it was a jsr/bsr, and the dispatcher's frame is here
