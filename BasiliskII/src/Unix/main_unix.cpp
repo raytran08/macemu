@@ -1699,7 +1699,8 @@ bf_dump_ring(void)
 		int n = 0;
 		size_t nlen = sizeof(n);
 
-		if (sysctlbyname("kern.bfast.trace_n", &n, &nlen, NULL, 0) == 0 &&
+		if (getenv("BII_DUMP_RING") != NULL &&
+		    sysctlbyname("kern.bfast.trace_n", &n, &nlen, NULL, 0) == 0 &&
 		    n > 0 &&
 		    sysctlbyname("kern.bfast.trace_ring", ring, &rlen,
 		        NULL, 0) == 0) {

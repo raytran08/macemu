@@ -701,13 +701,43 @@ For contrast, the surrounding Toolbox traps resolve normally to ROM:
 40826f92 and 40826f9e both resolve to 0081c490, and 408270b0/b4 to
 0081c312.  Only A815 goes to RAM.
 
-So the picture is coherent for the first time: the guest patches
-_SCSIDispatch into RAM, that RAM patch services selector 4, and the stack
-it leaves is not what the caller at 00010f4a expects.  Whether the patch
-is at fault, or whether it is a correct patch defeated by something our
-SCSI emulation does or fails to do beneath it, is the remaining question
--- and it is now a question about a specific, identified, 128-byte piece
-of code.  That is guest/ROM-patch territory rather than emulator
+ROOT CAUSE.  Dumping the RAM patch and decoding it by hand:
+
+    f100:  moveal %sp@+,%a0        pop the return address
+    f102:  movew  %sp@+,%d0        pop the selector word
+    f104:  movel  %a0,%sp@-        push the return address back
+    f106:  cmpiw  #24,%d0          selector in range?
+    f10a:  bccs   0xf116           no -> ROM reject path (0x408266fe)
+    f10c:  link   %fp,#-6
+    f110:  jmp    0x408266b4       -> STRAIGHT INTO THE ROM SCSI MANAGER
+
+Selector 4 passes the range check and jumps to a HARD-CODED ROM address.
+Meanwhile Basilisk installs its _SCSIDispatch replacement at
+find_rom_trap(0xa815), which on this ROM resolves to offset 0x7460, i.e.
+0x40807460.  Replicating find_rom_trap against the ROM image confirms it.
+
+    Basilisk's replacement:  0x40807460
+    the RAM patch jumps to:  0x408266b4      <-- MISMATCH
+
+So the System's own SCSI patch bypasses Basilisk's replacement entirely.
+It knows the ROM's internals and jumps past the trap entry -- note both
+sites begin with the same shape (`cmpiw #N,%d0` range check then
+`link %fp,#-6`), so 0x408266b4 is an inner entry point of the same
+manager, reached without ever touching the patched trap vector.
+
+The guest therefore runs the REAL ROM SCSI Manager, which talks to
+hardware that does not exist under emulation.  That accounts for every
+observation: selector 4 never reaching our replacement; the stack after
+the trap not being what the caller expects; the failure reproducing on
+two independent System 7.5 images (both install this patch); and Disk
+Tools 7.1 being unaffected (it installs no such patch).
+
+Fixing it means making Basilisk's SCSI replacement reachable from the
+inner entry point as well -- e.g. patching 0x408266b4 too, or patching
+the RAM routine's jump target once it is installed.  Both need care:
+the inner entry is reached with the selector already popped, so the
+replacement's stack arithmetic (which expects `ret, selector` on entry)
+does not apply unchanged there.  That is guest/ROM-patch territory rather than emulator
 territory -- which is consistent with everything else that has been
 cleared here, and means the next work is understanding what that resume
 path is FOR (which trap it is entitled to resume, and how it is supposed
