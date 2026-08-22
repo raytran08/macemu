@@ -311,3 +311,34 @@ Note on measuring: at an idle Finder the guest spins and trap rate is
 workload-dependent, so per-trap cost derived from idle numbers is
 unreliable.  The 31us figure came from a busy period.  Any future
 comparison must be a runtime A/B inside one run, in the same guest state.
+
+
+## idlewait does NOT work on the native path (tested)
+
+At an idle desktop the guest spins: ~8,800 traps/s and no idle CPU.
+Basilisk has idle detection for exactly this (`--idlewait true`,
+SynchIdleTime patched to M68K_EMUL_OP_IDLE_TIME, which calls
+idle_wait()).  Two things were wrong with it here:
+
+1. idle_resume() was never called from the native path.  It appears only
+   in the UAE glue, and timer_amiga.cpp carries the note nobody acted on:
+   "XXX if you implement this make sure to call idle_resume() from
+   TriggerInterrupt()".  That call is now added -- correct in itself, and
+   harmless when idlewait is off.
+
+2. It still hangs, and the reason is structural.  On the native path
+   EmulOp runs inside the SIGILL handler, so idle_wait() blocks on a
+   condition variable IN SIGNAL CONTEXT with signals masked.  Observed:
+   the guest stops dead at the "Starting up..." splash, bfast still
+   attached (attach=1, n_fast frozen at 3.6M), the process spinning in
+   host code at 75%.
+
+So `--idlewait true` must NOT be used on this port.  Making it work would
+mean moving the idle block out of signal context -- e.g. having the
+EmulOp set a flag and having the outer native loop wait -- which is real
+surgery, not a pref.
+
+The idle spin is therefore still the reason an idle desktop pins the CPU,
+and remains unsolved.  It matters less than it looks: the machine has
+nothing else to do, and what makes the guest FEEL slow is per-trap cost
+while it is working, not what it does while idle.

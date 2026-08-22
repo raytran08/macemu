@@ -1516,6 +1516,24 @@ void ClearInterruptFlag(uint32 flag)
 #if !EMULATED_68K
 void TriggerInterrupt(void)
 {
+	/*
+	 * Wake the guest if it is parked in idle_wait().
+	 *
+	 * idle_resume() is called from the UAE glue (basilisk_glue.cpp) but
+	 * nothing on the native 68k path ever called it, so enabling
+	 * `idlewait` here made the guest sleep and never wake -- it hangs
+	 * during startup with the "Starting up..." splash on screen and zero
+	 * traps executing.  timer_amiga.cpp carries the instruction that was
+	 * never followed for this path:
+	 *
+	 *   "XXX if you implement this make sure to call idle_resume()
+	 *    from TriggerInterrupt()"
+	 *
+	 * Harmless when idlewait is off: idle_resume() returns immediately
+	 * unless a thread is actually parked.
+	 */
+	idle_resume();
+
 #if defined(HAVE_PTHREADS)
 	pthread_kill(emul_thread, SIG_IRQ);
 #else
