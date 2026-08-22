@@ -1596,10 +1596,23 @@ static void *tick_func(void *arg)
 	while (!tick_thread_cancel) {
 		if (!tick_inhibit)
 			one_tick();
-		if (bii_shift_boot && ++bii_shift_ticks > 60 * 8) {
-			bii_shift_boot = false;
-			ADBKeyUp(0x38);
-			fprintf(stderr, "SHIFT released\n");
+		/*
+		 * Hold Shift for the extensions-off boot.
+		 *
+		 * Asserting it once before Start680x0 is not enough: the
+		 * guest initialises ADB during early boot and the key state
+		 * does not survive that.  So re-assert on every tick until
+		 * well past the point where MacOS samples the keyboard to
+		 * decide whether to load extensions, then release.
+		 */
+		if (bii_shift_boot) {
+			if (++bii_shift_ticks > 60 * 25) {
+				bii_shift_boot = false;
+				ADBKeyUp(0x38);
+				fprintf(stderr, "SHIFT released after %ld "
+				    "ticks\n", bii_shift_ticks);
+			} else
+				ADBKeyDown(0x38);
 		}
 		next += 16625;
 		int64 delay = next - GetTicks_usec();

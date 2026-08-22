@@ -633,6 +633,22 @@ different.  A truncated copy of the same install (interrupted transfer,
 burst of one repeating EMUL_OP -- the signature of reads running off the
 end of the file.  Nothing like the 0x9fc0000 fault.
 
+EXTENSIONS ARE NOT INVOLVED, AND SHIFT-BOOT IS MOOT.  Capturing the
+guest screen DURING the boot rather than after the crash shows where it
+actually gets to: at 14 seconds it is still displaying the happy Mac
+icon -- the earliest boot screen, before "Welcome to Macintosh" and well
+before any INIT loads.  The crash follows shortly after.
+
+So the guest dies during early System startup, at a point where no
+extensions have been loaded and there is nothing for an extensions-off
+boot to disable.  That explains why holding Shift changed nothing, in
+both the injected and the physical attempt, and retires the "faulty
+install / bad extension" line of inquiry entirely.
+
+(The heavy CHECKLOAD traffic in the trap ring is not extension loading:
+vCheckLoad fires for every resource load, and early System startup loads
+plenty.)
+
 So the remaining candidate is the first: the resume path selects the
 wrong frame.  That is guest/ROM-patch territory rather than emulator
 territory -- which is consistent with everything else that has been
