@@ -17,6 +17,35 @@ The native backend (`src/native_cpu/`, `Unix/asm_support.s`) is present.
 So applications inside the emulator run at the host's real speed and the
 display is the entire cost. Everything below follows from that.
 
+
+### Do not give the DGA window a blank X cursor
+
+The obvious tidy-up -- `XDefineCursor` an empty pixmap cursor on the
+wscons window, the way `driver_window` does with its `no_cursor`, and pass
+that cursor to `XGrabPointer` -- **breaks mouse clicks**.  The pointer
+still moves, so it looks harmless; but button events stop reaching the
+guest entirely.  The likely mechanism is that the cursor is rejected,
+`XGrabPointer` fails with BadCursor, and the grab is therefore never
+established.  Motion continues to look normal because under `-kcursor`
+dafbcons draws the pointer from the vertical blank interrupt, in the
+kernel, whether or not the emulator has a pointer grab -- which makes a
+dead grab remarkably convincing.
+
+It is also unnecessary.  The `hw.dafbcons.cursor` stand-down in the
+`driver_wscons` constructor does the job: the sysctl reads 0 for as long
+as the guest holds the display, and no cursor is drawn over the guest.
+
+Stray X-shaped marks on the guest desktop are not evidence against it.
+They are droppings left on the framebuffer *before* the guest took over,
+and they persist only because nothing repaints that region afterwards.
+Judge this from a fresh run, not from marks inherited from the last one.
+
+Unrelated latent bug noticed while looking: `XCreatePixmap` leaves the
+pixmap contents **undefined**, and `driver_window`'s no_cursor has always
+depended on them being zero.  It works because the servers in practice
+zero new pixmaps, not because it is correct.
+
+
 ## The problem with the stock X11 path
 
 `video_x.cpp` is the only video backend in `Unix/`. Its windowed mode
