@@ -701,6 +701,30 @@ For contrast, the surrounding Toolbox traps resolve normally to ROM:
 40826f92 and 40826f9e both resolve to 0081c490, and 408270b0/b4 to
 0081c312.  Only A815 goes to RAM.
 
+CORRECTION FIRST -- the "ROOT CAUSE" below is NOT sufficient, and the
+section is kept only because the mechanism it describes is real.
+
+The SCSI-bypass explanation predicted that a ROM where the traps reach
+Basilisk's replacement would not show this fault.  Tested: under the Mac
+IIci ROM the traps DO reach it (29 SCSI_DISPATCH calls arrive, selectors
+0/1/2), the disk is read normally (313 DISK_PRIME calls, 72 CHECKLOAD),
+and the guest STILL dies at exactly 0x9fc0000 with the same registers --
+just several minutes later.  The prediction failed, so the bypass is not
+the whole story.
+
+What now stands: the same fault, at the same address, with the same
+misaligned-longword signature, across THREE ROMs (Quadra 650, Quadra
+700/900, Mac IIci) and TWO independently sourced System 7.5 images.  It
+is systematic to this port, not specific to a ROM, a disk, or the SCSI
+patch.
+
+The bypass described below is still real and still worth fixing -- it is
+demonstrably true that the System's RAM patch jumps past Basilisk's
+replacement on the Quadra 650 ROM -- but it is at most a contributing
+path, not the cause.
+
+--- original section follows ---
+
 ROOT CAUSE.  Dumping the RAM patch and decoding it by hand:
 
     f100:  moveal %sp@+,%a0        pop the return address

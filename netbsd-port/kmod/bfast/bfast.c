@@ -709,7 +709,18 @@ bf_clog_ill(uint32_t *r)
 	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
 	e->pc = 0xe3110000u;	/* marker: EMUL_OP seen */
 	e->a2 = bf_frame_pc(f);
-	e->fp = BF_R_A(r, 6);
+	/*
+	 * Record the opcode too.  The pc alone cannot be attributed to a
+	 * particular EmulOp without knowing where each patch landed, and
+	 * several land at runtime-computed offsets (sony_offset and
+	 * friends).  The opcode names it directly.
+	 */
+	{
+		uint16_t op;
+
+		e->fp = (ufetch_16((const uint16_t *)bf_frame_pc(f), &op) == 0)
+		    ? (uint32_t)op : 0xffffffffu;
+	}
 	e->usp = bf_usp_read();
 	bf_tr_n++;
 }
