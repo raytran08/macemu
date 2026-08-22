@@ -860,6 +860,42 @@ So the SCSI replacement's stack convention is CORRECT for this caller,
 and the earlier suspicion of it is closed for good rather than merely
 set aside.
 
+WHAT THE PATCH CALLS INTO, and the first concrete mechanism hypothesis
+grounded in read code rather than inference.
+
+0x40807ae0 is a linked-list walker that runs as a CRITICAL SECTION:
+
+    40807ac8..40807af6   walk and patch a queue via a4@(80), a4@(84)
+    40807afc:  moveml %sp@+,%d1/%a2-%a3
+    40807b00:  movew  %sp@+,%sr        <-- restores the interrupt mask
+    40807b04:  rts
+
+So the RAM patch's full sequence is: install its own callback vector at
+[0xc0c]+8, jsr into this ROM routine which edits a queue with interrupts
+MASKED, then restore the vector.
+
+The interaction worth testing: on real hardware `move (sp)+,sr` restores
+the mask atomically and any pending interrupt is taken cleanly at an
+instruction boundary.  Here that instruction is TRAPPED and emulated, and
+lowering the mask with InterruptFlags pending is exactly the case that
+calls TriggerInterrupt -- which raises SIGURG, so sigirq_handler then
+builds a faked interrupt frame on the guest stack.  That delivery happens
+while the patch's temporary vector is still installed at [0xc0c]+8 and
+while the ROM routine is midway through returning.
+
+This is precisely the fragility upstream warns about ("manually call the
+Mac 68k interrupt handler with a faked stack frame"), located at a
+specific instruction for the first time.
+
+HOW TO TEST IT, cheaply and without a hack: log every interrupt delivery
+whose interrupted pc lies inside 0x40807ac0-0x40807b06, and see whether
+the crash correlates.  bfast already records interrupt deliveries and the
+userland ring already marks them; this needs only a pc-range filter.  If
+the correlation holds, the fix is to defer delivery until the guest has
+left the critical section rather than injecting mid-return -- which is a
+correctness fix, not a workaround, since real hardware could not deliver
+there either.
+
 Searching also found no evidence that anyone has previously run System
 7.5 to a desktop under native 68k mode on NetBSD/mac68k.  The only
 NetBSD/mac68k mailing-list discussion located (1999) is an inquiry about
