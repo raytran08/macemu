@@ -80,6 +80,8 @@ static uint32_t	bf_tr_n;		/* total logged since load */
 static uint32_t	bf_tr_window;		/* logged in the current window */
 static uint32_t	bf_trace_arm_pc;	/* sysctl: arm on this A-line pc */
 static uint32_t	bf_tr_armed_ret;	/* pc that closes the window */
+static uint32_t	bf_arm_now;		/* sysctl: arm at the next priv trap */
+#define BF_MARK_ARM	0xfeedfaceu	/* ring marker: tracing armed here */
 
 /* Registered user addresses of Basilisk's virtual-SR state. */
 static uint32_t	bf_uaddr_emulsr;	/* uint16 EmulatedSR */
@@ -433,6 +435,14 @@ bf_ctrap_priv(uint32_t *r)
 		break;
 
 	case 0x4e73: {				/* rte */
+		/*
+		 * Diagnostic for the 0x9fc0000 hunt: when the IRQ glue's
+		 * terminating rte (always at 00809b88) pops a PC outside
+		 * guest code, log a marker BEFORE emulating it, carrying
+		 * the popped pc, the frame address, and the guest sp.
+		 * 0x00A00000 covers 8MB RAM + 1MB ROM at 0x800000 +
+		 * headroom; the wild value is far above it.
+		 */
 		static const int frame_adj[16] = {
 			0, 0, 4, 4, 8, 0, 0, 52, 50, 12, 24, 84, 16, 0, 0, 0
 		};
@@ -448,6 +458,16 @@ bf_ctrap_priv(uint32_t *r)
 		if (ufetch_16((const uint16_t *)(usp + 6), &fmt))
 			goto defer;
 		npc = ((uint32_t)pc_hi << 16) | pc_lo;
+		if (__predict_false(pc == 0x00809b88 && npc >= 0x00a00000)) {
+			struct bf_tr_ent *e =
+			    &bf_tr[bf_tr_n & (BF_TRN - 1)];
+
+			e->pc = 0xbadc0deu;	/* marker: bad rte frame */
+			e->a2 = npc;		/* the popped pc */
+			e->fp = nsr | ((uint32_t)fmt << 16); /* sr + format */
+			e->usp = usp;		/* where the frame was */
+			bf_tr_n++;
+		}
 		if ((st = bf_store_sr(f, nsr)) != 0)
 			goto defer;
 		bf_frame_set_pc(f, npc);
@@ -459,6 +479,18 @@ bf_ctrap_priv(uint32_t *r)
 		goto defer;
 	}
 
+	if (__predict_false(bf_arm_now)) {
+		struct bf_tr_ent *e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
+
+		bf_arm_now = 0;
+		f->sr |= 0x8000;
+		bf_tr_window = 0;
+		e->pc = BF_MARK_ARM;
+		e->a2 = pc;		/* where the arm took effect */
+		e->fp = BF_R_A(r, 6);
+		e->usp = bf_usp_read();
+		bf_tr_n++;
+	}
 	bf_n_fast++;
 	return 1;
 
@@ -713,6 +745,13 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTLFLAG_READONLY, CTLTYPE_INT, "n_chain_priv",
 			    SYSCTL_DESCR("other-source vector 8 traps"),
 			    NULL, 0, &bf_n_chain_priv, 0,
+			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
+			sysctl_createv(&bf_clog, 0, NULL, NULL,
+			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,
+			    CTLTYPE_INT, "arm_now",
+			    SYSCTL_DESCR("arm tracing at the next "
+			        "fast-pathed privileged op"),
+			    NULL, 0, &bf_arm_now, 0,
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE,

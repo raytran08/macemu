@@ -201,6 +201,34 @@ Tracer limitation to remember: any 60Hz delivery inside a traced window
 kills the trace (the T1 strip), so windows that need to survive an
 interrupt must be re-armed from the interrupt path itself.
 
+IRQ-armed round, done: sigirq_handler now writes kern.bfast.arm_now at
+each delivery and the module sets T1 at the next fast-pathed privileged
+op -- the IRQ glue's own SR write, moments later.  This works (147 armed
+windows, 2.15 million instructions traced in one run) and closes the
+strip gap, because a second delivery simply re-arms.
+
+It also refuted the leading hypothesis.  A check placed inside the rte
+emulation -- flag any rte at 00809b88, the IRQ glue's terminating rte,
+that pops a pc outside guest memory -- NEVER FIRES.  The interrupt return
+is not what delivers the bad PC.
+
+Going back over the one clean end-to-end trace confirms the actual
+transfer instruction: the resume tail jmp's to the RAM hook, and the
+hook's own `rts` at 00010f4c pops 09fc0000 off the guest stack into the
+PC.  An rts, not an rte.  So the question is narrowed again: what put a
+Fixed value in the longword that rts pops, given the watchpoint already
+proved the write at 005fa19e is an innocent push in a healthy context.
+The remaining candidate is the OTHER slot -- the one the rts actually
+reads at the fatal depth -- which was never watched.
+
+Two tracer improvements needed before the next round, both learnt here:
+- gate tracing to guest PCs (< 0x00a00000).  T1 currently survives into
+  the emulator's own code and libc, so a wrapped ring can be entirely
+  host instructions -- one run's ring held nothing but 0x0c5xxxxx and
+  0x0802xxxx addresses.
+- move the watchpoint to the address the fatal rts pops (derive it from
+  usp at 00010f4c), rather than the a2 save slot.
+
 Instrumentation for this is in main_unix.cpp behind the SIGSEGV dump: a
 24-entry ring of (pc, opcode, a7) filled on every signal-path trap, the
 guest stack, and the full register file captured in sigsegv.cpp's handler

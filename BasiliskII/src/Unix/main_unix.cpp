@@ -1792,6 +1792,18 @@ static void sigirq_handler(int sig, siginfo_t *sip, void *uap)
 	bf_ring_add((uint32)sc_pc, (uint32)sc_sp, (uint32)gr[_REG_A0 + 2],
 	    (uint32)gr[_REG_A0 + 3], BF_MARK_IRQ);
 
+	/*
+	 * Ask bfast to arm single-step tracing at the next fast-pathed
+	 * privileged op -- the IRQ glue's own SR writes, moments from now.
+	 * The T1 bit cannot be set here: it is in PSL_MBZ and setcontext
+	 * would refuse the context.  Absent the module this simply fails.
+	 */
+	{
+		static int one = 1;
+		sysctlbyname("kern.bfast.arm_now", NULL, NULL,
+		    &one, sizeof(one));
+	}
+
 	// Jump to MacOS interrupt handler on return
 	sc_pc = ReadMacInt32(0x64);
 	/*
