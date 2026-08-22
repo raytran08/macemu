@@ -460,12 +460,35 @@ runs even in boots where the a815 at 00010f48 definitely traps, so that
 A815 is dispatched somewhere other than Basilisk's replacement -- the
 trap table entry has evidently been re-patched by the OS.
 
-Next: instrument the DEPTH rather than the data.  Log the guest sp at
-every A-line reflection and every rte, and diff a healthy pass of this
-code path against the fatal one; the extra frame will show as a divergence
-at a specific trap.  bfast already records usp on every ring entry, so
-this is analysis of data already being captured rather than a new
-instrument.
+Depth analysis done, on rings already captured -- no new build.  The
+fatal pass ends:
+
+    40826f6a  moveml %sp@+,%d3-%d7/%a2-%a4   usp 005fa18a -> 005fa1aa
+    40826f78  unlk   %fp                     fp=005fa190, usp -> 005fa194
+    408265f0  (resume tail)                  usp=005fa194
+    4082661e  moveal %sp@+,%a0               a0 <- [005fa194] = 00010f4a
+
+So the resume tail's stack pointer comes straight from `unlk`, i.e. from
+the frame pointer: a6 = 005fa190 here, where a healthy pass has
+005fa198.  THE FRAME POINTER ITSELF IS 8 BYTES LOW, and since `link` sets
+a6 from sp, the stack was already 8 bytes low when that function was
+entered.  Nothing in this function is at fault; it inherits the skew.
+
+Tracing a6 back: it takes the value 005fa190 between the EMUL_OP at
+008870ae (BLOCK_MOVE) and the one at 0086c6ea (CHECKLOAD) -- inside an
+EMUL_OP gap, so the `link` itself is not traced.
+
+CURRENT STATE OF THE QUESTION.  An extra 8 bytes -- one A-line exception
+frame -- is present on the guest stack before this function is entered.
+Everything after that is correct code operating on a wrong stack.  The
+task is to find where the stack first diverges, which is a matter of
+walking sp backwards through the rings across successive EMUL_OP
+boundaries, comparing against a pass that survives.
+
+Practical note for whoever continues: the useful comparison is between
+two passes through the SAME code in one run (this path executes many
+times before the fatal one), not between runs.  bfast's rings already
+contain both.
 
 Superseded options, kept for the record:
 1. Emulate the faulting store inside the SIGSEGV handler (decode the
