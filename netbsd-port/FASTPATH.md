@@ -243,3 +243,47 @@ exactly zero, and have been across every run).
 - The module is 68040-only and NetBSD 10.1-specific: it reads curpcb, assumes
   the mac68k VBR arrangement, and emits cpusha as a raw opcode because kmod
   builds target the 68020 baseline.
+
+
+## Remaining performance levers (measured at the System 7.5 desktop)
+
+Baseline: 24,021 in-kernel traps/s, 25% user / 75% system, which is
+**31us per trap** -- roughly double the 15us the design assumed.  Over
+16.2M traps the mix is:
+
+    a-line reflection   5,185,053   32%
+    007c ori #,sr       2,845,183   18%
+    40c0 move sr,d0     2,749,803   17%
+    40e7 move sr,-(sp)  1,469,425    9%
+    46df move (sp)+,sr  1,461,864    9%
+    46c0 move d0,sr     1,373,355    8%
+    everything else     under 1% each
+
+Defers are 6,339 of 16.2M -- 0.04% -- so there is NOTHING left to win by
+handling more opcodes in the kernel.  The remaining wins are all in
+per-trap cost:
+
+1. BATCH THE USER ACCESSES.  ufetch/ustore are out-of-line and each sets
+   up PCB_ONFAULT for one word; the SR ops do two or three per trap.
+   One guard per trap, with inline `moves`, should remove a large slice
+   of the 31us.  MUST establish a fault label properly -- a bare `moves`
+   without PCB_ONFAULT panics the kernel instead of declining, which is
+   how a first attempt at this was written and correctly thrown away.
+
+2. ASM FAST PATH FOR THE TOP FIVE (61% of traps).  Those five opcodes
+   touch at most one data register and the frame, yet every one pays
+   `moveml` of all 16 registers out and back -- 128 bytes of memory
+   traffic -- plus a C call.  Handling them in the stub and falling
+   through to C for the rest avoids nearly all of it.
+
+3. A-LINE REFLECTION IN ASM (another 32%), same argument.  It needs
+   three guest-stack stores and a vector fetch, so it depends on (1).
+
+Not worth pursuing: video already draws direct to the framebuffer with
+no per-frame cost; the 60Hz tick is 60 signals against 24,000 traps;
+cpusha and rte are 13k and 17k respectively.
+
+Risk note: all three touch trap-level kernel code on the only machine
+this runs on.  A mistake panics it and costs an fsck.  The current state
+boots System 7.5 to the desktop and holds; these are worth doing
+deliberately, not at the end of a long session.
