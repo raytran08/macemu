@@ -553,6 +553,14 @@ bf_ctrap_aline(uint32_t *r)
 
 	if (__predict_false(curproc->p_pid != bf_pid))
 		return 0;
+
+	/*
+	 * A-line reflections are ~35% of all traps, so sampling the watched
+	 * slot here roughly triples the coverage of the trap-time watch.
+	 * It cannot see a write that happens between two traps, but it
+	 * narrows the bracket, which is the point.
+	 */
+	bf_watch_check(bf_frame_pc(f));
 	uint32_t pc = bf_frame_pc(f);
 	uint32_t usp = bf_usp_read();
 	uint32_t npc;

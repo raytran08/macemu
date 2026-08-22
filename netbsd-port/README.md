@@ -428,7 +428,46 @@ instruction.  What is not known is which instruction writes 00010f4a into
 watchpoint, page protection) each fail for the same structural reason:
 the write occurs in a stretch where no trap-based instrument is live.
 
-Remaining options, in order of soundness:
+RESOLVED WHAT THE VALUE IS -- and it is not corruption at all.
+
+Adding the watch check to the A-line reflection handler (A-lines are 35%
+of traps, so this roughly triples sampling) catches the transition in two
+steps:
+
+    slot: 31300000 -> 31300004   noticed at 00010f48
+    slot: 31300004 -> 00010f4a   noticed at 40827210
+
+00010f48 is the `a815` in the RAM hook, and 00010f4a is precisely its
+return address -- which the guest's own A-line dispatcher writes there on
+purpose (`movel %a2,%sp@(12)` at 8099ce, where a2 is trapPC+2).  The
+value is legitimate, written by legitimate code, at the correct place for
+its own purpose.
+
+So there is NO stray write and nothing overwrites anything.  The defect
+is that the resume tail at 4082661e later pops that same slot expecting a
+RESUME address (00010f2a, the hook's entry).  Two different things claim
+the same longword, which can only happen if the stack is at the wrong
+depth -- and the depth difference measured earlier is exactly 8 bytes,
+the size of one A-line exception frame (SR 2 + PC 4 + format/vector 2).
+
+That reframes the whole hunt: the question is not "what writes the slot"
+but "why is there one extra A-line frame on the stack when the resume
+tail runs".  Every instrument that failed above was answering the wrong
+question.
+
+Worth noting alongside: the SCSIDispatch probe shows selector 4 never
+runs even in boots where the a815 at 00010f48 definitely traps, so that
+A815 is dispatched somewhere other than Basilisk's replacement -- the
+trap table entry has evidently been re-patched by the OS.
+
+Next: instrument the DEPTH rather than the data.  Log the guest sp at
+every A-line reflection and every rte, and diff a healthy pass of this
+code path against the fatal one; the extra frame will show as a divergence
+at a specific trap.  bfast already records usp on every ring entry, so
+this is analysis of data already being captured rather than a new
+instrument.
+
+Superseded options, kept for the record:
 1. Emulate the faulting store inside the SIGSEGV handler (decode the
    instruction, perform the write, skip it) so the page NEVER has to be
    unprotected.  This is the correct fix to the technique above and is
