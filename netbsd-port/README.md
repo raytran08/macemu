@@ -812,6 +812,54 @@ may be inherent to reproducing Mac supervisor-mode semantics with
 signals, and a fix may require changing the approach rather than
 correcting an error.
 
+THE RAM PATCH, READ AS A WHOLE ROUTINE (dumped from guest memory, since
+it is RAM and absent from the ROM image):
+
+    10ef0:  moveal 0xc0c,%a0
+    10ef4:  movel  %a0@(8),%sp@-        save a vector from [0xc0c]+8
+    10ef8:  lea    %pc@(0x10f4e),%a1
+    10efc:  movel  %a1,%a0@(8)          install 10f4e in its place
+    ...
+    10f10:  jsr    0x40807ae0           call into ROM with it installed
+    10f16:  moveal 0xc0c,%a0
+    10f1a:  movel  %sp@+,%a0@(8)        restore the vector
+    10f1e:  bsrs   0x10f22              call the SCSI probe
+    10f20:  bras   0x10f5e
+
+    10f22:  clrw   %sp@-                <-- RESULT SPACE, pushed FIRST
+    10f24:  movew  #10,%sp@-            selector 10 (SCSIStat)
+    10f28:  a815
+    10f2a:  andiw  #66,%sp@             test the result IN PLACE at [sp]
+    10f2e:  beqs   0x10f4a
+    10f30:  andiw  #2,%sp@
+    10f34:  bnes   0x10f4a
+    10f36:  pea    0x9fa                params for SCSIComplete
+    10f3a:  pea    0x9fc
+    10f3e:  movel  #300,%sp@-
+    10f44:  movew  #4,%sp@-             selector 4
+    10f48:  a815
+    10f4a:  addql  #2,%sp               drop the result
+    10f4c:  rts                         back to 10f20
+
+This settles the calling-convention question left open earlier.  The
+`clrw %sp@-` at 10f22 pushes the two-byte result space BEFORE the
+parameters -- exactly the convention Basilisk's replacement assumes --
+and the code then tests that result in place at [sp] after the trap, so
+the trap must return with sp pointing at it.
+
+Working through both calls against emul_op.cpp confirms the arithmetic
+is right.  For selector 10: after `a7 += 6` the handler writes the result
+at a7+0, which is the result slot, with stack=0, so a1 lands exactly on
+it.  For selector 4: after `a7 += 6` the parameters read at a7+0/+4/+8
+are 300, 0x9fc, 0x9fa in the right order, the result is written at a7+12
+-- again exactly the result slot -- and stack=12 puts a1 back on it.
+Both are correct, and 10f4a is reached by ordinary control flow (the beq
+and bne) as well as by returning from the selector-4 trap.
+
+So the SCSI replacement's stack convention is CORRECT for this caller,
+and the earlier suspicion of it is closed for good rather than merely
+set aside.
+
 Searching also found no evidence that anyone has previously run System
 7.5 to a desktop under native 68k mode on NetBSD/mac68k.  The only
 NetBSD/mac68k mailing-list discussion located (1999) is an inquiry about

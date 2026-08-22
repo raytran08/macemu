@@ -1801,6 +1801,23 @@ bf_dump_ring(void)
 			fprintf(stderr, "  %08x: %04x %04x %04x %04x\n", a,
 			    ReadMacInt16(a), ReadMacInt16(a + 2),
 			    ReadMacInt16(a + 4), ReadMacInt16(a + 6));
+
+		/*
+		 * The whole RAM-patch region the crash lands in, as one
+		 * block, so it can be disassembled as a routine rather than
+		 * squinted at in fragments.  0x10e00-0x10f80 covers the
+		 * entry seen under the IIci ROM (00010ed2) and the hook and
+		 * tail seen under the Quadra (00010f2a..00010f4c).
+		 */
+		fprintf(stderr, "RAM patch region 0x00010e00..0x00010f80:\n");
+		for (a = 0x00010e00; a < 0x00010f80; a += 16) {
+			unsigned k;
+
+			fprintf(stderr, "  %08x:", a);
+			for (k = 0; k < 16; k += 2)
+				fprintf(stderr, " %04x", ReadMacInt16(a + k));
+			fprintf(stderr, "\n");
+		}
 	}
 
 	/*
