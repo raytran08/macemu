@@ -218,34 +218,15 @@ static void bf_watch_check(uint32_t here);
  * moveml #0xffff -- so ascending memory holds d0-d7, a0-a6, the useless
  * a7 slot, the pad, and then the hardware exception frame.
  */
-/*
- * Two register-block shapes.
- *
- * The privileged and A-line stubs save only d0,d1,a0,a1 -- what the hot
- * opcodes need -- so each trap moves 16 bytes of stack instead of 128,
- * on a path taken ~28,000 times a second.  Opcodes wanting d2-d7 or
- * a2-a6 decline to the signal path; together they are under 0.1% of
- * traps.
- *
- * The EMUL_OP stub keeps the full save, because building the trampoline
- * frame needs every register, and it runs ~100 times a second where the
- * cost is irrelevant.  It must therefore use the _F_ accessors: the
- * small ones would read a0-a7 from the wrong offsets and place the
- * exception frame 48 bytes out.
- */
-#define BF_R_D(r, n)	((r)[(n)])		/* small block: d0,d1 */
-#define BF_R_A(r, n)	((r)[2 + (n)])		/* small block: a0,a1 */
-#define BF_R_HAVE(n)	((n) <= 1)
-#define BF_F_D(r, n)	((r)[(n)])		/* full block: d0..d7 */
-#define BF_F_A(r, n)	((r)[8 + (n)])		/* full block: a0..a7 */
+#define BF_R_D(r, n)	((r)[(n)])
+#define BF_R_A(r, n)	((r)[8 + (n)])		/* a0..a6 only */
 struct bf_hwframe {
 	uint16_t	sr;
 	uint16_t	pc_hi;		/* split to dodge misalignment */
 	uint16_t	pc_lo;
 	uint16_t	fmtvec;
 } __packed;
-#define BF_FRAME(r)	((struct bf_hwframe *)((char *)(r) + 5 * 4))
-#define BF_FRAME_FULL(r) ((struct bf_hwframe *)((char *)(r) + 17 * 4))
+#define BF_FRAME(r)	((struct bf_hwframe *)((char *)(r) + 17 * 4))
 
 static inline uint32_t
 bf_frame_pc(const struct bf_hwframe *f)
@@ -292,18 +273,18 @@ __asm(
 "	cmpl	bf_pcb,%d0\n"
 "	jne	1f\n"
 "	movl	%sp@+,%d0\n"
-"	clrl	%sp@-\n"		/* pad, keeps the frame offset even */
-"	moveml	#0xc0c0,%sp@-\n"	/* d0,d1,a0,a1 only: 16 bytes */
+"	clrl	%sp@-\n"		/* pad, mirrors the stock handlers */
+"	moveml	#0xffff,%sp@-\n"	/* d0-d7/a0-a7 ascending */
 "	movl	%sp,%sp@-\n"		/* arg: register block */
 "	jbsr	bf_ctrap_priv\n"
 "	addql	#4,%sp\n"
 "	tstl	%d0\n"
 "	jeq	0f\n"
-"	moveml	%sp@+,#0x0303\n"	/* d0,d1,a0,a1 */
-"	addql	#4,%sp\n"		/* drop pad */
+"	moveml	%sp@+,#0x7fff\n"	/* d0-d7/a0-a6; NOT the a7 slot */
+"	addql	#8,%sp\n"		/* drop a7 slot + pad */
 "	rte\n"				/* handled: resume the guest */
-"0:	moveml	%sp@+,#0x0303\n"
-"	addql	#4,%sp\n"
+"0:	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
 "	movl	bf_orig_priv,%sp@-\n"
 "	rts\n"
 "1:	movl	%sp@+,%d0\n"
@@ -322,17 +303,17 @@ __asm(
 "	jne	1f\n"
 "	movl	%sp@+,%d0\n"
 "	clrl	%sp@-\n"
-"	moveml	#0xc0c0,%sp@-\n"	/* d0,d1,a0,a1 only */
+"	moveml	#0xffff,%sp@-\n"
 "	movl	%sp,%sp@-\n"
 "	jbsr	bf_ctrap_aline\n"
 "	addql	#4,%sp\n"
 "	tstl	%d0\n"
 "	jeq	0f\n"
-"	moveml	%sp@+,#0x0303\n"
-"	addql	#4,%sp\n"
+"	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
 "	rte\n"
-"0:	moveml	%sp@+,#0x0303\n"
-"	addql	#4,%sp\n"
+"0:	moveml	%sp@+,#0x7fff\n"
+"	addql	#8,%sp\n"
 "	movl	bf_orig_aline,%sp@-\n"
 "	rts\n"
 "1:	movl	%sp@+,%d0\n"
@@ -606,11 +587,7 @@ bf_ctrap_priv(uint32_t *r)
 	case 0x40d0: case 0x40d1: case 0x40d2: case 0x40d3:
 	case 0x40d4: case 0x40d5: case 0x40d6: case 0x40d7: {
 						/* move sr,(an) */
-		uint32_t an;
-
-		if ((op & 7) != 7 && !BF_R_HAVE(op & 7))
-			goto defer;
-		an = (op & 7) == 7 ? usp : BF_R_A(r, op & 7);
+		uint32_t an = (op & 7) == 7 ? usp : BF_R_A(r, op & 7);
 
 		if (bf_get_sr(f, &sr))
 			goto defer;
@@ -623,7 +600,7 @@ bf_ctrap_priv(uint32_t *r)
 	case 0x40c0: case 0x40c1: case 0x40c2: case 0x40c3:
 	case 0x40c4: case 0x40c5: case 0x40c6: case 0x40c7:
 						/* move sr,dn */
-		if (!BF_R_HAVE(op & 7) || bf_get_sr(f, &sr))
+		if (bf_get_sr(f, &sr))
 			goto defer;
 		BF_R_D(r, op & 7) = (BF_R_D(r, op & 7) & 0xffff0000) | sr;
 		bf_frame_set_pc(f, pc + 2);
@@ -632,8 +609,6 @@ bf_ctrap_priv(uint32_t *r)
 	case 0x46c0: case 0x46c1: case 0x46c2: case 0x46c3:
 	case 0x46c4: case 0x46c5: case 0x46c6: case 0x46c7:
 						/* move dn,sr */
-		if (!BF_R_HAVE(op & 7))
-			goto defer;
 		if ((st = bf_store_sr(f, (uint16_t)BF_R_D(r, op & 7))) != 0)
 			goto defer;
 		bf_frame_set_pc(f, pc + 2);
@@ -887,7 +862,7 @@ bf_watch_check(uint32_t here)
 int
 bf_clog_ill(uint32_t *r)
 {
-	struct bf_hwframe *f = BF_FRAME_FULL(r);
+	struct bf_hwframe *f = BF_FRAME(r);
 	struct bf_tr_ent *e;
 	uint16_t eop;
 
@@ -938,10 +913,10 @@ bf_clog_ill(uint32_t *r)
 		bad |= ustore_32((uint32_t *)(S - 10), S);	/* a7 */
 		for (i = 6; i >= 0; i--)
 			bad |= ustore_32((uint32_t *)(S - 10 - 4 * (7 - i)),
-			    BF_F_A(r, i));
+			    BF_R_A(r, i));
 		for (i = 7; i >= 0; i--)
 			bad |= ustore_32((uint32_t *)(S - 42 - 4 * (7 - i)),
-			    BF_F_D(r, i));
+			    BF_R_D(r, i));
 		if (bad)
 			return 0;			/* fall back to signals */
 
@@ -996,12 +971,10 @@ bf_clog_ill(uint32_t *r)
 	return 0;
 }
 
-/* NOTE: the trace stub keeps the FULL save, so this handler must
-   use the _F_ accessors and BF_FRAME_FULL. */
 int
 bf_ctrap_trace(uint32_t *r)
 {
-	struct bf_hwframe *f = BF_FRAME_FULL(r);
+	struct bf_hwframe *f = BF_FRAME(r);
 	struct bf_tr_ent *e;
 	uint32_t pc = bf_frame_pc(f);
 	static uint32_t watch_last;
@@ -1076,7 +1049,7 @@ bf_ctrap_trace(uint32_t *r)
 
 		v->pc = pc;
 		v->sp = sp;
-		v->fp = 0;	/* a6 not saved on this path */
+		v->fp = BF_R_A(r, 6);
 		/*
 		 * At the function's `link` (408268ca) the longword at [sp]
 		 * is the return address, which names the caller -- that is
@@ -1097,11 +1070,11 @@ bf_ctrap_trace(uint32_t *r)
 			uint32_t tw;
 
 			/* a2 holds the trap pc; read the trap word itself */
-			v->a0 = (ufetch_16((const uint16_t *)BF_F_A(r, 2),
+			v->a0 = (ufetch_16((const uint16_t *)BF_R_A(r, 2),
 			    (uint16_t *)&tw) == 0) ? (tw & 0xffff) : 0xffffffffu;
-			v->a0 = BF_F_A(r, 2);	/* the trapping pc */
+			v->a0 = BF_R_A(r, 2);	/* the trapping pc */
 		} else
-			v->a0 = BF_F_A(r, 0);
+			v->a0 = BF_R_A(r, 0);
 		bf_al_prune(sp);
 		v->aln = (uint32_t)bf_al_n;
 		v->alpc = bf_al_n > 0 ? bf_al_pc[bf_al_n - 1] : 0;
@@ -1131,7 +1104,7 @@ bf_ctrap_trace(uint32_t *r)
 	 * and below the observed stack around 0x005fa000.
 	 */
 	if (__predict_false(pc == 0x40826e86)) {
-		uint32_t a0 = BF_F_A(r, 0);
+		uint32_t a0 = BF_R_A(r, 0);
 
 		if (a0 >= 0x00500000) {
 			struct bf_tr_ent *fe =
@@ -1139,16 +1112,16 @@ bf_ctrap_trace(uint32_t *r)
 
 			fe->pc = 0xf111u << 16;	/* marker: fill in stack */
 			fe->a2 = a0;		/* destination */
-			fe->fp = BF_F_D(r, 0);	/* value being stored */
-			fe->usp = BF_F_D(r, 1);	/* dbf counter remaining */
+			fe->fp = BF_R_D(r, 0);	/* value being stored */
+			fe->usp = BF_R_D(r, 1);	/* dbf counter remaining */
 			bf_tr_n++;
 		}
 	}
 
 	e = &bf_tr[bf_tr_n & (BF_TRN - 1)];
 	e->pc = pc;
-	e->a2 = BF_F_A(r, 2);
-	e->fp = BF_F_A(r, 6);
+	e->a2 = BF_R_A(r, 2);
+	e->fp = BF_R_A(r, 6);
 	e->usp = bf_usp_read();
 	bf_tr_n++;
 	bf_tr_window++;

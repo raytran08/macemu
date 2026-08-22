@@ -417,3 +417,52 @@ the startup dialog correctly, no corruption.
 
 Combined with the BLOCK_MOVE change, system time is down from 75% to
 35% and boot from 104s to 73s.
+
+
+## Lever: reduce the register save on the hot stubs (~3%)
+
+The privileged and A-line stubs saved all sixteen registers per trap --
+128 bytes of stack traffic on a path taken ~29,000 times a second.  They
+now save only d0,d1,a0,a1 (mask 0xc0c0 / 0x0303), which is what the hot
+opcodes need; anything wanting d2-d7 or a2-a6 declines to the signal
+path, measured at 2 defers/s against 29,000 traps.
+
+Measured: user 23.4% -> 26.4%.  Real but small, so `moveml` was not the
+dominant cost.  Kept.
+
+TWO BUGS CAUGHT IN REVIEW BEFORE THIS SHIPPED, both of the same kind:
+the EMUL_OP stub and the trace stub still save the FULL sixteen, so their
+handlers must use separate accessors.  With the shared macros they would
+have read a0-a7 from the wrong offsets and located the exception frame 48
+bytes out -- silent guest corruption on every EMUL_OP.  There are now two
+accessor sets (BF_R_* small, BF_F_* full) and two frame macros, and each
+handler is annotated with which shape its stub produces.
+
+## Where the remaining time goes, and why the next lever was NOT pulled
+
+At a genuine idle desktop -- dialog dismissed, see BII_AUTO_RETURN -- the
+guest generates ~29,000 traps/s and the split is 26% user / 74% system,
+which is ~25us per trap.  The C handler measures 14us of that (clock
+calibrated), leaving ~11us of CPU exception entry, stub, and rte, most of
+which is not reducible in software.
+
+The remaining candidate is inlining the user accesses: ufetch/ustore are
+out-of-line and each establishes PCB_ONFAULT for one word, two or three
+per trap.  Doing it properly means setting pcb_onfault once around the
+whole handler and using raw `moves`, with a fault label reached by
+GCC's label-as-value.  The kernel mechanism is simple and well-defined
+(m68k trap.c: on a kernel bus error it sets f_pc = pcb_onfault and
+d0 = EFAULT, then returns), but correctness depends on the compiler
+making no register assumptions at that label.
+
+NOT DONE, deliberately: the gain is maybe 10us of a 25us trap, and a
+mistake panics the machine.  That trade is wrong on an unattended box
+that currently boots System 7.5 and holds.  If it is attempted, do it
+with the machine attended and revert to commit c13630ce if it misbehaves.
+
+## Also note: the idle desktop is trap-bound, boot is disk-bound
+
+Boot barely moved across all of this (104s -> 73s) because it waits on
+DISK_PRIME file I/O.  The desktop is entirely different: 29,000 traps/s
+of SR manipulation from the Finder's event loop, where per-trap cost is
+everything.  Measure the right one for the change being made.

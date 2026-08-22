@@ -117,6 +117,11 @@ using std::string;
  * the guest starts.
  */
 static bool native_traps_ready = false;
+/* BII_AUTO_RETURN=n: tap Return n seconds in, to clear the
+   "not shut down properly" dialog, whose modal loop spins far harder
+   than the real desktop and poisons any measurement taken with it up. */
+static int bii_auto_return;
+static long bii_return_ticks;
 /* BII_NO_FLUSHALL=1 disables the whole-cache shortcut, for A/B testing. */
 static bool flush_all_ok = true;
 
@@ -1231,6 +1236,9 @@ int main(int argc, char **argv)
 	if (getenv("BII_TRACE_REARM") != NULL)
 		bf_trace_rearm = true;
 
+	if (getenv("BII_AUTO_RETURN") != NULL)
+		bii_auto_return = atoi(getenv("BII_AUTO_RETURN"));
+
 	if (getenv("BII_NO_TICK") != NULL) {
 		extern bool tick_inhibit;
 		tick_inhibit = true;
@@ -1682,6 +1690,7 @@ static void one_tick(...)
 bool tick_inhibit;
 bool bii_shift_boot;
 static long bii_shift_ticks;
+
 static void *tick_func(void *arg)
 {
 	uint64 start = GetTicks_usec();
@@ -1699,6 +1708,21 @@ static void *tick_func(void *arg)
 		 * well past the point where MacOS samples the keyboard to
 		 * decide whether to load extensions, then release.
 		 */
+		/*
+		 * BII_AUTO_RETURN=n: tap Return n seconds in.  System 7.5
+		 * puts up "this computer may not have been shut down
+		 * properly" after every unclean exit, and that dialog spins
+		 * a modal loop generating ~21,000 traps/s -- three times the
+		 * real desktop.  Any measurement taken with it on screen is
+		 * measuring the dialog, not the system.
+		 */
+		if (bii_auto_return > 0 &&
+		    ++bii_return_ticks == 60 * bii_auto_return) {
+			ADBKeyDown(0x24);	/* Return */
+			ADBKeyUp(0x24);
+			fprintf(stderr, "auto-Return sent\n");
+		}
+
 		if (bii_shift_boot) {
 			if (++bii_shift_ticks > 60 * 25) {
 				bii_shift_boot = false;
