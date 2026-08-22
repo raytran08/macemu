@@ -1,7 +1,7 @@
 /* evdump - print bfast's event log (passes through watched pcs). */
 #include <sys/sysctl.h>
 #include <stdio.h>
-struct e { unsigned pc, sp, fp, a0, aln, alpc, f[4], fsp[4]; };
+struct e { unsigned pc, sp, fp, a0, aln, alpc, f[4], fsp[4], fsr[4]; };
 int main(void) {
 	static struct e v[256];
 	size_t vl = sizeof(v), nl = sizeof(int);
@@ -15,8 +15,9 @@ int main(void) {
 		struct e *p = &v[k & 255];
 		printf("%4d pc=%08x sp=%08x depth=%u\n", k, p->pc, p->sp, p->aln);
 		{ int i; for (i = 0; i < 4 && p->f[i]; i++)
-			printf("            frame[-%d] from %08x at sp %08x\n",
-			    i, p->f[i], p->fsp[i]); }
+			printf("            frame[-%d] from %08x at sp %08x  guestSR=%04x%s\n",
+			    i, p->f[i], p->fsp[i], p->fsr[i] & 0xffff,
+			    (p->fsr[i] & 0x2000) ? " S" : "  (USER!)"); }
 	}
 	return 0;
 }

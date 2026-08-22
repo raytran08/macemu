@@ -91,7 +91,7 @@ static uint32_t	bf_tr_armed_ret;	/* pc that closes the window */
  */
 #define BF_EVN		256
 struct bf_ev_ent { uint32_t pc, sp, fp, a0, aln, alpc;
-			  uint32_t f[4], fsp[4]; };
+			  uint32_t f[4], fsp[4], fsr[4]; };
 
 /*
  * Shadow stack of live A-line frames.
@@ -107,6 +107,7 @@ struct bf_ev_ent { uint32_t pc, sp, fp, a0, aln, alpc;
 #define BF_ALN		32
 static uint32_t	bf_al_sp[BF_ALN];
 static uint32_t	bf_al_pc[BF_ALN];
+static uint32_t	bf_al_sr[BF_ALN];	/* guest SR seen at each reflection */
 static int	bf_al_n;
 
 static void
@@ -626,6 +627,7 @@ bf_ctrap_aline(uint32_t *r)
 	if (bf_al_n < BF_ALN) {
 		bf_al_sp[bf_al_n] = usp - 8;	/* the frame just pushed */
 		bf_al_pc[bf_al_n] = pc;		/* the trapping instruction */
+		bf_al_sr[bf_al_n] = sr;		/* the SR the guest had */
 		bf_al_n++;
 	}
 
@@ -828,6 +830,7 @@ bf_ctrap_trace(uint32_t *r)
 
 				v->f[i]   = (j >= 0) ? bf_al_pc[j] : 0;
 				v->fsp[i] = (j >= 0) ? bf_al_sp[j] : 0;
+				v->fsr[i] = (j >= 0) ? bf_al_sr[j] : 0;
 			}
 		}
 		bf_ev_n++;
@@ -1050,7 +1053,7 @@ bfast_modcmd(modcmd_t cmd, void *aux)
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,
 			    CTLFLAG_READONLY, CTLTYPE_STRUCT, "events",
-			    SYSCTL_DESCR("struct {u32 pc,sp,fp,a0,aln,alpc,f[4],fsp[4]}[256]"),
+			    SYSCTL_DESCR("struct {u32 pc,sp,fp,a0,aln,alpc,f[4],fsp[4],fsr[4]}[256]"),
 			    NULL, 0, bf_ev, sizeof(bf_ev),
 			    CTL_KERN, n, CTL_CREATE, CTL_EOL);
 			sysctl_createv(&bf_clog, 0, NULL, NULL,

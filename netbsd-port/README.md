@@ -596,9 +596,26 @@ What is not yet pinned is which of those two is wrong -- whether the
 resume path should be pointed at a different frame, or whether trap #2
 should never have been taken while trap #1 was in flight (i.e. whether
 our A-line reflection permits a nesting the real hardware would not).
-The second is the one that would put the defect back in this port, and
-it is testable: compare the guest's SR/interrupt state at trap #2 against
-what a real 68040 would have had after trap #1.
+
+TESTED, AND THE SECOND IS FALSE.  Recording the guest SR at every A-line
+reflection shows, without exception:
+
+    guestSR=2000 S     (and 2004 where a condition code is set)
+
+The supervisor bit is set at every reflection and the interrupt mask is
+ZERO.  That is exactly the state a real 68040 would be in: an A-line
+exception sets S and does NOT raise the IPL (only interrupt exceptions
+do), so nested A-line traps are perfectly legal on the hardware and the
+guest is entitled to take trap #2 while trap #1 is in flight.  Our
+reflection is reproducing hardware behaviour correctly, and the nesting
+is not a defect of this port.
+
+So the remaining candidate is the first: the resume path selects the
+wrong frame.  That is guest/ROM-patch territory rather than emulator
+territory -- which is consistent with everything else that has been
+cleared here, and means the next work is understanding what that resume
+path is FOR (which trap it is entitled to resume, and how it is supposed
+to identify it) rather than instrumenting the emulator further.
 
 Superseded options, kept for the record:
 1. Emulate the faulting store inside the SIGSEGV handler (decode the
